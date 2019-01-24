@@ -10,6 +10,7 @@
 #include "GameplayTagAssetInterface.h"
 #include "VRInteractibleFunctionLibrary.h"
 #include "PhysicsEngine/ConstraintInstance.h"
+#include "Components/StaticMeshComponent.h"
 
 #include "PhysicsPublic.h"
 
@@ -59,6 +60,7 @@ enum class EVRInteractibleLeverReturnType : uint8
 
 /** Delegate for notification when the lever state changes. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FVRLeverStateChangedSignature, bool, LeverStatus, EVRInteractibleLeverEventType, LeverStatusType, float, LeverAngleAtTime);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVRLeverFinishedLerpingSignature, float, FinalAngle);
 
 /**
 * A Lever component, can act like a lever, door, wheel, joystick.
@@ -81,6 +83,12 @@ public:
 
 	UFUNCTION(BlueprintImplementableEvent, meta = (DisplayName = "Lever State Changed"))
 		void ReceiveLeverStateChanged(bool LeverStatus, EVRInteractibleLeverEventType LeverStatusType, float LeverAngleAtTime);
+
+	UPROPERTY(BlueprintAssignable, Category = "VRLeverComponent")
+		FVRLeverFinishedLerpingSignature OnLeverFinishedLerping;
+
+	UFUNCTION(BlueprintImplementableEvent, meta = (DisplayName = "Lever Finished Lerping"))
+		void ReceiveLeverFinishedLerping(float LeverFinalAngle);
 
 	// Primary axis angle only
 	UPROPERTY(BlueprintReadOnly, Category = "VRLeverComponent")
@@ -253,6 +261,7 @@ public:
 			{
 				MomentumAtDrop = 0.0f;
 				this->SetComponentTickEnabled(false);
+				bIsLerping = false;
 				bReplicateMovement = true;
 				return;
 			}
@@ -287,6 +296,7 @@ public:
 			else
 			{
 				this->SetComponentTickEnabled(false);
+				bIsLerping = false;
 				bReplicateMovement = true;
 				this->SetRelativeRotation((FTransform(SetAxisValue(TargetAngle, FRotator::ZeroRotator)) * InitialRelativeTransform).Rotator());
 			}
@@ -399,15 +409,17 @@ public:
 		EGripMovementReplicationSettings MovementReplicationSetting;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
-		float BreakDistance;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
 		float Stiffness;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
 		float Damping;
 
-	UPROPERTY(BlueprintReadWrite, Category = "VRGripInterface")
+	// Distance before the object will break out of the hand, 0.0f == never will
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
+		float BreakDistance;
+
+	// Should we deny gripping on this object
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
 		bool bDenyGripping;
 
 	UPROPERTY(BlueprintReadOnly, Category = "VRGripInterface")
@@ -440,7 +452,7 @@ public:
 
 #if WITH_PHYSX
 	physx::PxD6Joint* HandleData;
-	int32 SceneIndex;
+	//int32 SceneIndex;
 #endif
 
 	bool DestroyConstraint()
@@ -449,12 +461,14 @@ public:
 		if (HandleData)
 		{
 			// use correct scene
-			PxScene* PScene = GetPhysXSceneFromIndex(SceneIndex);
+			PxScene* PScene = HandleData->getScene();//GetPhysXSceneFromIndex(SceneIndex);
 			if (PScene)
 			{
-				SCOPED_SCENE_WRITE_LOCK(PScene);
+				PScene->lockWrite();
+				//SCOPED_SCENE_WRITE_LOCK(PScene);
 				// Destroy joint.
 				HandleData->release();
+				PScene->unlockWrite();
 			}
 
 			HandleData = NULL;
@@ -497,88 +511,93 @@ public:
 		FRotator AngularRotationOffset = SetAxisValue(rotationalOffset, FRotator::ZeroRotator);
 		FTransform RefFrame2 = FTransform(InitialRelativeTransform.GetRotation() * AngularRotationOffset.Quaternion(), A2Transform.InverseTransformPosition(GetComponentLocation()));
 		
-		ExecuteOnPxRigidDynamicReadWrite(rBodyInstance, [&](PxRigidDynamic* Actor)
+		// If we don't already have a handle - make one now.
+		if (!HandleData)
 		{
-			PxScene* Scene = Actor->getScene();
-
-			// If we don't already have a handle - make one now.
-			if (!HandleData)
+			FPhysicsCommand::ExecuteWrite(BodyInstance.ActorHandle, [&](const FPhysicsActorHandle& Actor)
+				//ExecuteOnPxRigidDynamicReadWrite(rBodyInstance, [&](PxRigidDynamic* Actor)
 			{
-				PxD6Joint* NewJoint = NULL;
-				PxRigidDynamic * ParentBody = NULL;
-
-				if (ParentComponent.IsValid())
+				if (PxRigidActor* PActor = FPhysicsInterface::GetPxRigidActor_AssumesLocked(Actor))
 				{
-					UPrimitiveComponent * PrimComp = Cast<UPrimitiveComponent>(ParentComponent.Get());
+					PxScene* Scene = PActor->getScene();
+					PxD6Joint* NewJoint = NULL;
+					PxRigidDynamic * ParentBody = NULL;
 
-					if (PrimComp)
-						ParentBody = PrimComp->BodyInstance.GetPxRigidDynamic_AssumesLocked();
+					if (ParentComponent.IsValid())
+					{
+						UPrimitiveComponent * PrimComp = Cast<UPrimitiveComponent>(ParentComponent.Get());
+
+						if (PrimComp && PrimComp->BodyInstance.IsValidBodyInstance())
+						{
+							ParentBody = FPhysicsInterface::GetPxRigidDynamic_AssumesLocked(PrimComp->BodyInstance.ActorHandle);
+							//ParentBody = PrimComp->BodyInstance.GetPxRigidDynamic_AssumesLocked();
+						}
+					}
+
+					NewJoint = PxD6JointCreate(Scene->getPhysics(), ParentBody, U2PTransform(RefFrame2), PActor, PxTransform(PxIdentity));
+
+					if (!NewJoint)
+					{
+						HandleData = NULL;
+					}
+					else
+					{
+						// No constraint instance
+						NewJoint->userData = NULL; // don't need
+						HandleData = NewJoint;
+
+						// Remember the scene index that the handle joint/actor are in.
+						FPhysScene* RBScene = FPhysxUserData::Get<FPhysScene>(Scene->userData);
+						const uint32 SceneType = rBodyInstance->UseAsyncScene(RBScene) ? PST_Async : PST_Sync;
+						//SceneIndex = RBScene->PhysXSceneIndex[SceneType];
+
+						// Pretty Much Unbreakable
+						NewJoint->setBreakForce(PX_MAX_REAL, PX_MAX_REAL);
+						//	NewJoint->setConstraintFlag(PxConstraintFlag::ePROJECTION, true);
+
+						//	NewJoint->setConstraintFlag(PxConstraintFlag::eCOLLISION_ENABLED, false);
+
+						PxConstraintFlags Flags = NewJoint->getConstraintFlags();
+
+						// False flags
+						//Flags |= PxConstraintFlag::ePROJECTION;
+						Flags |= PxConstraintFlag::eCOLLISION_ENABLED;
+
+						// True flags
+						Flags &= ~PxConstraintFlag::ePROJECTION;
+
+						NewJoint->setConstraintFlag(PxConstraintFlag::ePROJECTION, true);
+						NewJoint->setProjectionAngularTolerance(FMath::DegreesToRadians(0.1f));
+						NewJoint->setProjectionLinearTolerance(0.1f);
+						NewJoint->setConstraintFlags(Flags);
+
+						// Setting up the joint
+						NewJoint->setMotion(PxD6Axis::eX, PxD6Motion::eLOCKED);
+						NewJoint->setMotion(PxD6Axis::eY, PxD6Motion::eLOCKED);
+						NewJoint->setMotion(PxD6Axis::eZ, PxD6Motion::eLOCKED);
+
+						NewJoint->setMotion(PxD6Axis::eTWIST, LeverRotationAxis == EVRInteractibleLeverAxis::Axis_X || LeverRotationAxis == EVRInteractibleLeverAxis::Axis_XY ? PxD6Motion::eLIMITED : PxD6Motion::eLOCKED);
+						NewJoint->setMotion(PxD6Axis::eSWING1, LeverRotationAxis == EVRInteractibleLeverAxis::Axis_Y || LeverRotationAxis == EVRInteractibleLeverAxis::Axis_XY ? PxD6Motion::eLIMITED : PxD6Motion::eLOCKED);
+						NewJoint->setMotion(PxD6Axis::eSWING2, PxD6Motion::eLOCKED);
+
+						const float CorrectedLeverLimit = (LeverLimitPositive + LeverLimitNegative) / 2;
+						const float LeverLimitRad = CorrectedLeverLimit * (PI / 180.0f);
+						//PxReal LimitContactDistance = FMath::DegreesToRadians(FMath::Max(1.f, ProfileInstance.ConeLimit.ContactDistance));
+
+						//The limit values need to be clamped so it will be valid in PhysX
+						PxReal ZLimitAngle = FMath::ClampAngle(CorrectedLeverLimit, KINDA_SMALL_NUMBER, 179.9999f) * (PI / 180.0f);
+						PxReal YLimitAngle = FMath::ClampAngle(CorrectedLeverLimit, KINDA_SMALL_NUMBER, 179.9999f) * (PI / 180.0f);
+						//PxReal LimitContactDistance = FMath::DegreesToRadians(FMath::Max(1.f, ProfileInstance.ConeLimit.ContactDistance * FMath::Min(InSwing1LimitScale, InSwing2LimitScale)));
+
+						NewJoint->setSwingLimit(PxJointLimitCone(YLimitAngle, ZLimitAngle));
+						NewJoint->setTwistLimit(PxJointAngularLimitPair(-LeverLimitRad, LeverLimitRad));
+
+						return true;
+					}
 				}
-
-				NewJoint = PxD6JointCreate(Scene->getPhysics(), ParentBody, U2PTransform(RefFrame2), Actor, PxTransform(PxIdentity));
-
-				if (!NewJoint)
-				{
-					HandleData = NULL;
-				}
-				else
-				{
-					// No constraint instance
-					NewJoint->userData = NULL; // don't need
-					HandleData = NewJoint;
-
-					// Remember the scene index that the handle joint/actor are in.
-					FPhysScene* RBScene = FPhysxUserData::Get<FPhysScene>(Scene->userData);
-					const uint32 SceneType = rBodyInstance->UseAsyncScene(RBScene) ? PST_Async : PST_Sync;
-					SceneIndex = RBScene->PhysXSceneIndex[SceneType];
-
-					// Pretty Much Unbreakable
-					NewJoint->setBreakForce(PX_MAX_REAL, PX_MAX_REAL);
-				//	NewJoint->setConstraintFlag(PxConstraintFlag::ePROJECTION, true);
-					
-				//	NewJoint->setConstraintFlag(PxConstraintFlag::eCOLLISION_ENABLED, false);
-
-					PxConstraintFlags Flags = NewJoint->getConstraintFlags();
-
-					// False flags
-					//Flags |= PxConstraintFlag::ePROJECTION;
-					Flags |= PxConstraintFlag::eCOLLISION_ENABLED;
-					
-					// True flags
-					Flags &= ~PxConstraintFlag::ePROJECTION;
-
-					NewJoint->setConstraintFlag(PxConstraintFlag::ePROJECTION, true);
-					NewJoint->setProjectionAngularTolerance(FMath::DegreesToRadians(0.1f));
-					NewJoint->setProjectionLinearTolerance(0.1f);
-					NewJoint->setConstraintFlags(Flags);
-					
-					// Setting up the joint
-					NewJoint->setMotion(PxD6Axis::eX, PxD6Motion::eLOCKED);
-					NewJoint->setMotion(PxD6Axis::eY, PxD6Motion::eLOCKED);
-					NewJoint->setMotion(PxD6Axis::eZ, PxD6Motion::eLOCKED);
-
-					NewJoint->setMotion(PxD6Axis::eTWIST, LeverRotationAxis == EVRInteractibleLeverAxis::Axis_X || LeverRotationAxis == EVRInteractibleLeverAxis::Axis_XY ? PxD6Motion::eLIMITED : PxD6Motion::eLOCKED);
-					NewJoint->setMotion(PxD6Axis::eSWING1, LeverRotationAxis == EVRInteractibleLeverAxis::Axis_Y || LeverRotationAxis == EVRInteractibleLeverAxis::Axis_XY ? PxD6Motion::eLIMITED : PxD6Motion::eLOCKED);
-					NewJoint->setMotion(PxD6Axis::eSWING2, PxD6Motion::eLOCKED);
-
-					const float CorrectedLeverLimit = (LeverLimitPositive + LeverLimitNegative) / 2;
-					const float LeverLimitRad = CorrectedLeverLimit * (PI / 180.0f);
-					//PxReal LimitContactDistance = FMath::DegreesToRadians(FMath::Max(1.f, ProfileInstance.ConeLimit.ContactDistance));
-
-					//The limit values need to be clamped so it will be valid in PhysX
-					PxReal ZLimitAngle = FMath::ClampAngle(CorrectedLeverLimit, KINDA_SMALL_NUMBER, 179.9999f) * (PI / 180.0f);
-					PxReal YLimitAngle = FMath::ClampAngle(CorrectedLeverLimit, KINDA_SMALL_NUMBER, 179.9999f) * (PI / 180.0f);
-					//PxReal LimitContactDistance = FMath::DegreesToRadians(FMath::Max(1.f, ProfileInstance.ConeLimit.ContactDistance * FMath::Min(InSwing1LimitScale, InSwing2LimitScale)));
-					
-					NewJoint->setSwingLimit(PxJointLimitCone(YLimitAngle, ZLimitAngle));
-					NewJoint->setTwistLimit(PxJointAngularLimitPair(-LeverLimitRad, LeverLimitRad));
-
-					return true;
-				}
-			}
-
-			return false;
-		});
+				return false;
+			});
+		}
 		
 #else
 		return false;
@@ -683,6 +702,9 @@ public:
 	//UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
 		//FBPInteractionSettings GetInteractionSettings();
 
+	// Get grip scripts
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
+		bool GetGripScripts(TArray<UVRGripScriptBase*> & ArrayReference);
 
 	// Events //
 

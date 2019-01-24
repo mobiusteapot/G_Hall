@@ -1,6 +1,7 @@
 // Copyright 1998-2016 Epic Games, Inc. All Rights Reserved.
 
-#include "VRButtonComponent.h"
+#include "Interactibles/VRButtonComponent.h"
+#include "GameFramework/Character.h"
 
   //=============================================================================
 UVRButtonComponent::UVRButtonComponent(const FObjectInitializer& ObjectInitializer)
@@ -83,8 +84,8 @@ void UVRButtonComponent::TickComponent(float DeltaTime, enum ELevelTick TickType
 					LastToggleTime = WorldTime;
 					bToggledThisTouch = true;
 					bButtonState = !bButtonState;
-					ReceiveButtonStateChanged(bButtonState);
-					OnButtonStateChanged.Broadcast(bButtonState);
+					ReceiveButtonStateChanged(bButtonState, LastInteractingActor.Get(), LastInteractingComponent.Get());
+					OnButtonStateChanged.Broadcast(bButtonState, LastInteractingActor.Get(), LastInteractingComponent.Get());
 				}
 			}
 		}
@@ -95,7 +96,12 @@ void UVRButtonComponent::TickComponent(float DeltaTime, enum ELevelTick TickType
 		if (this->RelativeLocation.Equals(GetTargetRelativeLocation()))
 		{
 			this->SetComponentTickEnabled(false);
+
+			OnButtonEndInteraction.Broadcast(LastInteractingActor.Get(), LastInteractingComponent.Get());
+			ReceiveButtonEndInteraction(LastInteractingActor.Get(), LastInteractingComponent.Get());
+
 			InteractingComponent.Reset(); // Just reset it here so it only does it once
+			LastInteractingComponent.Reset();
 		}
 		else
 			this->SetRelativeLocation(FMath::VInterpConstantTo(this->RelativeLocation, GetTargetRelativeLocation(), DeltaTime, DepressSpeed), false);
@@ -108,11 +114,12 @@ void UVRButtonComponent::TickComponent(float DeltaTime, enum ELevelTick TickType
 		// Check for if we should set the state of the button, done here as for the press button the lerp counts for input
 		bool bCheckState = (GetAxisValue(InitialRelativeTransform.InverseTransformPosition(this->RelativeLocation)) <= (-ButtonEngageDepth) + KINDA_SMALL_NUMBER);
 		if (bButtonState != bCheckState && (WorldTime - LastToggleTime) >= MinTimeBetweenEngaging)
+
 		{
 			LastToggleTime = WorldTime;
 			bButtonState = bCheckState;
-			ReceiveButtonStateChanged(bButtonState);
-			OnButtonStateChanged.Broadcast(bButtonState);
+			ReceiveButtonStateChanged(bButtonState, LastInteractingActor.Get(), LastInteractingComponent.Get());
+			OnButtonStateChanged.Broadcast(bButtonState, LastInteractingActor.Get(), LastInteractingComponent.Get());
 		}
 	}
 
@@ -159,6 +166,64 @@ bool UVRButtonComponent::IsValidOverlap_Implementation(UPrimitiveComponent * Ove
 	return false;
 }
 
+void UVRButtonComponent::SetLastInteractingActor()
+{
+
+	// Early out on the simple checks
+	if (!InteractingComponent.IsValid() || InteractingComponent == GetAttachParent() || InteractingComponent->GetAttachParent() == GetAttachParent())
+	{
+		LastInteractingActor.Reset();
+		LastInteractingComponent.Reset();
+		return;
+	}
+
+	LastInteractingComponent = InteractingComponent;
+
+	// Should return faster checking for owning character
+	AActor * OverlapOwner = InteractingComponent->GetOwner();
+	if (OverlapOwner && OverlapOwner->IsA(ACharacter::StaticClass()))
+	{
+		LastInteractingActor = OverlapOwner;
+		return;
+	}
+
+	// Now check for if it is a grippable object and if it is currently held
+	if (InteractingComponent->GetClass()->ImplementsInterface(UVRGripInterface::StaticClass()))
+	{
+		UGripMotionControllerComponent *Controller;
+		bool bIsHeld;
+		IVRGripInterface::Execute_IsHeld(LastInteractingComponent.Get(), Controller, bIsHeld);
+
+		if (bIsHeld && Controller && Controller->GetOwner())
+		{
+			LastInteractingActor = Controller->GetOwner();
+			return;
+		}
+	}
+	else if (OverlapOwner && OverlapOwner->GetClass()->ImplementsInterface(UVRGripInterface::StaticClass()))
+	{
+		UGripMotionControllerComponent *Controller;
+		bool bIsHeld;
+		IVRGripInterface::Execute_IsHeld(OverlapOwner, Controller, bIsHeld);
+
+		if (bIsHeld && Controller && Controller->GetOwner())
+		{
+			LastInteractingActor = Controller->GetOwner();
+			return;
+		}
+	}
+
+	// Fall back to the owner, wasn't held and wasn't a character
+	if (OverlapOwner)
+	{
+		LastInteractingActor = OverlapOwner;
+		return;
+	}
+
+	LastInteractingActor.Reset();
+	return;
+}
+
 void UVRButtonComponent::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
 {
 	// Other Actor is the actor that triggered the event. Check that is not ourself.  
@@ -173,6 +238,13 @@ void UVRButtonComponent::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, AAc
 		bToggledThisTouch = false;
 
 		this->SetComponentTickEnabled(true);
+
+		if (InteractingComponent != LastInteractingComponent.Get())
+		{
+			SetLastInteractingActor();
+			OnButtonBeginInteraction.Broadcast(LastInteractingActor.Get(), LastInteractingComponent.Get());
+			ReceiveButtonBeginInteraction(LastInteractingActor.Get(), LastInteractingComponent.Get());
+		}
 	}
 }
 

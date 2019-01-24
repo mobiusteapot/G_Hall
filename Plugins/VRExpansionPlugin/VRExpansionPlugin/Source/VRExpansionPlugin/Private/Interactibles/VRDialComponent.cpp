@@ -1,6 +1,6 @@
 // Copyright 1998-2016 Epic Games, Inc. All Rights Reserved.
 
-#include "VRDialComponent.h"
+#include "Interactibles/VRDialComponent.h"
 #include "Net/UnrealNetwork.h"
 
   //=============================================================================
@@ -31,6 +31,11 @@ UVRDialComponent::UVRDialComponent(const FObjectInitializer& ObjectInitializer)
 
 	MovementReplicationSetting = EGripMovementReplicationSettings::ForceClientSideMovement;
 	BreakDistance = 100.0f;
+
+	bLerpBackOnRelease = false;
+	bSendDialEventsDuringLerp = false;
+	DialReturnSpeed = 90.0f;
+	bIsLerping = false;
 }
 
 //=============================================================================
@@ -70,22 +75,48 @@ void UVRDialComponent::BeginPlay()
 
 void UVRDialComponent::TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction *ThisTickFunction)
 {
+	if (bIsLerping)
+	{
+		// Flip lerp direction if we are on the other side
+		if (CurrentDialAngle > ClockwiseMaximumDialAngle)
+			this->SetDialAngle(FMath::FInterpConstantTo(CurRotBackEnd, 360.f, DeltaTime, DialReturnSpeed), bSendDialEventsDuringLerp);
+		else
+			this->SetDialAngle(FMath::FInterpConstantTo(CurRotBackEnd, 0.f, DeltaTime, DialReturnSpeed), bSendDialEventsDuringLerp);
+
+		if (CurRotBackEnd == 0.f)
+		{
+			this->SetComponentTickEnabled(false);
+			bIsLerping = false;
+			OnDialFinishedLerping.Broadcast();
+			ReceiveDialFinishedLerping();
+		}
+	}
+	else
+	{
+		this->SetComponentTickEnabled(false); 
+	}
 }
 
 void UVRDialComponent::TickGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation, float DeltaTime) 
 {
 
 	// Handle the auto drop
-	if (GrippingController->HasGripAuthority(GripInformation) && FVector::DistSquared(InitialDropLocation, this->GetComponentTransform().InverseTransformPosition(GrippingController->GetComponentLocation())) >= FMath::Square(BreakDistance))
+	if (BreakDistance > 0.f && GrippingController->HasGripAuthority(GripInformation) && FVector::DistSquared(InitialDropLocation, this->GetComponentTransform().InverseTransformPosition(GrippingController->GetPivotLocation())) >= FMath::Square(BreakDistance))
 	{
 		GrippingController->DropObjectByInterface(this);
 		return;
 	}
 
+	/*FTransform CurrentRelativeTransform = InitialRelativeTransform * UVRInteractibleFunctionLibrary::Interactible_GetCurrentParentTransform(this);
+	FRotator curRotation = GrippingController->GetComponentTransform().GetRelativeTransform(CurrentRelativeTransform).Rotator();
+	*/
+
+	// #TODO: Should this use a pivot rotation? it wouldn't make that much sense to me?
 	FRotator curRotation = GrippingController->GetComponentRotation();
 
 	float DeltaRot = RotationScaler * GetAxisValue((curRotation - LastRotation).GetNormalized(), InteractorRotationAxis);
 	AddDialAngle(DeltaRot, true);
+
 
 	LastRotation = curRotation;
 }
@@ -98,14 +129,16 @@ void UVRDialComponent::OnGrip_Implementation(UGripMotionControllerComponent * Gr
 	FTransform ReversedRelativeTransform = FTransform(GripInformation.RelativeTransform.ToInverseMatrixWithScale());
 	FTransform RelativeToGripTransform = ReversedRelativeTransform * this->GetComponentTransform();
 
+	//FTransform InitialTrans = RelativeToGripTransform.GetRelativeTransform(CurrentRelativeTransform);
+
 	InitialInteractorLocation = CurrentRelativeTransform.InverseTransformPosition(RelativeToGripTransform.GetTranslation());
 	InitialDropLocation = ReversedRelativeTransform.GetTranslation();
 
-	//InitialInteractorLocation = this->GetComponentTransform().InverseTransformPosition(RelativeToGripTransform.GetTranslation());
-
 	// Need to rotate this by original hand to dial facing eventually
+	//LastRotation = RelativeToGripTransform.GetRelativeTransform(CurrentRelativeTransform).Rotator();
 	LastRotation = RelativeToGripTransform.GetRotation().Rotator(); // Forcing into world space now so that initial can be correct over the network
-	this->SetComponentTickEnabled(true);
+
+	bIsLerping = false;
 }
 
 void UVRDialComponent::OnGripRelease_Implementation(UGripMotionControllerComponent * ReleasingController, const FBPActorGripInformation & GripInformation, bool bWasSocketed) 
@@ -117,7 +150,13 @@ void UVRDialComponent::OnGripRelease_Implementation(UGripMotionControllerCompone
 		CurrentDialAngle = FRotator::ClampAxis(FMath::RoundToFloat(CurRotBackEnd));
 	}
 
-	this->SetComponentTickEnabled(false);
+	if (bLerpBackOnRelease)
+	{
+		bIsLerping = true;
+		this->SetComponentTickEnabled(true);
+	}
+	else
+		this->SetComponentTickEnabled(false);
 }
 
 void UVRDialComponent::OnChildGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation) {}
@@ -243,3 +282,8 @@ void UVRDialComponent::SetHeld_Implementation(UGripMotionControllerComponent * N
 {
 	return FBPInteractionSettings();
 }*/
+
+bool UVRDialComponent::GetGripScripts_Implementation(TArray<UVRGripScriptBase*> & ArrayReference)
+{
+	return false;
+}

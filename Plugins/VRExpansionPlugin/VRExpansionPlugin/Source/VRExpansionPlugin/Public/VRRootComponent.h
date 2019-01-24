@@ -35,6 +35,9 @@ public:
 
 	bool bCalledUpdateTransform;
 
+	// Overriding this and applying the offset to world position for the elements
+	virtual void GetNavigationData(FNavigationRelevantData& Data) const override;
+
 	FORCEINLINE void GenerateOffsetToWorld(bool bUpdateBounds = true, bool bGetPureYaw = true);
 
 	// If valid will use this as the tracked parent instead of the HMD / Parent
@@ -63,6 +66,11 @@ public:
 	inline void OnUpdateTransform_Public(EUpdateTransformFlags UpdateTransformFlags, ETeleportType Teleport = ETeleportType::None)
 	{
 		OnUpdateTransform(UpdateTransformFlags, Teleport);
+		if (bNavigationRelevant && bRegistered)
+		{
+			UpdateNavigationData();
+			PostUpdateNavigationData();
+		}
 	}
 
 protected:
@@ -105,6 +113,14 @@ public:
 	// The default 2.15 Z offset is to account for floor hover from the character movement component.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRExpansionLibrary")
 	FVector VRCapsuleOffset;
+
+	// #TODO: Test with 100.f rounding to make sure it isn't noticable, currently that is what it is
+	// If true will subtract the HMD's location from the position, useful for if the actors base is set to the HMD location always (simple character).
+	/*UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ReplicatedCamera")
+		bool bOffsetByHMD;
+		*/
+
+
 
 	// #TODO: See if making this multiplayer compatible is viable
 	// Offsets capsule to be centered on HMD - currently NOT multiplayer compatible
@@ -168,8 +184,10 @@ void inline UVRRootComponent::GenerateOffsetToWorld(bool bUpdateBounds, bool bGe
 	else
 		CamRotOffset = curCameraRot;
 
-
-	OffsetComponentToWorld = FTransform(CamRotOffset.Quaternion(), FVector(curCameraLoc.X, curCameraLoc.Y, bCenterCapsuleOnHMD ? curCameraLoc.Z : CapsuleHalfHeight) + CamRotOffset.RotateVector(VRCapsuleOffset), FVector(1.0f)) * GetComponentTransform();
+	/*if(bOffsetByHMD)
+		OffsetComponentToWorld = FTransform(CamRotOffset.Quaternion(), FVector(0, 0, bCenterCapsuleOnHMD ? curCameraLoc.Z : CapsuleHalfHeight) + CamRotOffset.RotateVector(VRCapsuleOffset), FVector(1.0f)) * GetComponentTransform();
+	else*/
+		OffsetComponentToWorld = FTransform(CamRotOffset.Quaternion(), FVector(curCameraLoc.X, curCameraLoc.Y, bCenterCapsuleOnHMD ? curCameraLoc.Z : CapsuleHalfHeight) + CamRotOffset.RotateVector(VRCapsuleOffset), FVector(1.0f)) * GetComponentTransform();
 
 	if (owningVRChar)
 	{
@@ -203,6 +221,14 @@ FORCEINLINE void UVRRootComponent::SetCapsuleSizeVR(float NewRadius, float NewHa
 	}
 
 	CapsuleHalfHeight = FMath::Max3(0.f, NewHalfHeight, NewRadius);
+
+	// Make sure that our character parent updates its replicated var as well
+	if (AVRBaseCharacter * BaseChar = Cast<AVRBaseCharacter>(GetOwner()))
+	{
+		if (GetNetMode() < ENetMode::NM_Client && BaseChar->VRReplicateCapsuleHeight)
+			BaseChar->ReplicatedCapsuleHeight.CapsuleHeight = CapsuleHalfHeight;
+	}
+
 	CapsuleRadius = FMath::Max(0.f, NewRadius);
 	UpdateBounds();
 	UpdateBodySetup();

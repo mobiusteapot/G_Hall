@@ -100,14 +100,14 @@ AVRBaseCharacter::AVRBaseCharacter(const FObjectInitializer& ObjectInitializer)
 
 void AVRBaseCharacter::OnRep_PlayerState()
 {
-	OnPlayerStateReplicated_Bind.Broadcast(PlayerState);
+	OnPlayerStateReplicated_Bind.Broadcast(GetPlayerState());
 	Super::OnRep_PlayerState();
 }
 
 void AVRBaseCharacter::GetLifetimeReplicatedProps(TArray< class FLifetimeProperty > & OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-	DOREPLIFETIME_CONDITION(AVRBaseCharacter, SeatInformation, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(AVRBaseCharacter, SeatInformation, COND_None);
 	DOREPLIFETIME_CONDITION(AVRBaseCharacter, VRReplicateCapsuleHeight, COND_None);
 	DOREPLIFETIME_CONDITION(AVRBaseCharacter, ReplicatedCapsuleHeight, COND_SimulatedOnly);
 }
@@ -142,6 +142,14 @@ void AVRBaseCharacter::Server_ReZeroSeating_Implementation(FVector_NetQuantize10
 	SeatInformation.StoredYaw = NewRelativeHeadYaw;
 	SeatInformation.StoredLocation = NewRelativeHeadLoc;
 
+
+	SeatInformation.StoredYaw = FMath::RoundToFloat(SeatInformation.StoredYaw * 100.f) / 100.f;
+
+	SeatInformation.StoredLocation.X = FMath::RoundToFloat(SeatInformation.StoredLocation.X * 100.f) / 100.f;
+	SeatInformation.StoredLocation.Y = FMath::RoundToFloat(SeatInformation.StoredLocation.Y * 100.f) / 100.f;
+	SeatInformation.StoredLocation.Z = FMath::RoundToFloat(SeatInformation.StoredLocation.Z * 100.f) / 100.f;
+
+
 	// Null out Z so we keep feet location if not zeroing to head
 	if (!bZeroToHead)
 		SeatInformation.StoredLocation.Z = 0.0f;
@@ -165,6 +173,11 @@ void AVRBaseCharacter::OnBeginWallPushback_Implementation(FHitResult HitResultOf
 }
 
 void AVRBaseCharacter::OnEndWallPushback_Implementation()
+{
+
+}
+
+void AVRBaseCharacter::OnClimbingSteppedUp_Implementation()
 {
 
 }
@@ -219,6 +232,228 @@ void AVRBaseCharacter::NotifyOfTeleport_Implementation()
 
 		if (RightMotionController)
 			RightMotionController->bIsPostTeleport = true;
+	}
+}
+
+void AVRBaseCharacter::TickSeatInformation(float DeltaTime)
+{
+	float LastThresholdScaler = SeatInformation.CurrentThresholdScaler;
+	bool bLastOverThreshold = SeatInformation.bIsOverThreshold;
+
+	FVector NewLoc = VRReplicatedCamera->RelativeLocation;
+
+	if (!SeatInformation.bZeroToHead)
+		NewLoc.Z = 0.0f;
+
+	float AbsDistance = FMath::Abs(FVector::Dist(SeatInformation.StoredLocation, NewLoc));
+
+	// If over the allowed distance
+	if (AbsDistance > SeatInformation.AllowedRadius)
+	{
+		// Force them back into range
+		FVector diff = NewLoc - SeatInformation.StoredLocation;
+		diff.Normalize();
+		diff = (-diff * (AbsDistance - SeatInformation.AllowedRadius));
+
+		FRotator Rot = FRotator(0.0f, -SeatInformation.StoredYaw, 0.0f);
+		SetSeatRelativeLocationAndRotationVR(SeatInformation.StoredLocation, (-SeatInformation.StoredLocation) + Rot.RotateVector(diff), Rot, true);
+		SeatInformation.bWasOverLimit = true;
+	}
+	else if (SeatInformation.bWasOverLimit) // Make sure we are in the zero point otherwise
+	{
+		SetSeatRelativeLocationAndRotationVR(SeatInformation.StoredLocation, -SeatInformation.StoredLocation, FRotator(0.0f, -SeatInformation.StoredYaw, 0.0f), true);
+		SeatInformation.bWasOverLimit = false;
+	}
+
+	if (AbsDistance > SeatInformation.AllowedRadius - SeatInformation.AllowedRadiusThreshold)
+		SeatInformation.bIsOverThreshold = true;
+	else
+		SeatInformation.bIsOverThreshold = false;
+
+	SeatInformation.CurrentThresholdScaler = FMath::Clamp((AbsDistance - (SeatInformation.AllowedRadius - SeatInformation.AllowedRadiusThreshold)) / SeatInformation.AllowedRadiusThreshold, 0.0f, 1.0f);
+
+	if (bLastOverThreshold != SeatInformation.bIsOverThreshold || !FMath::IsNearlyEqual(LastThresholdScaler, SeatInformation.CurrentThresholdScaler))
+	{
+		OnSeatThreshholdChanged(!SeatInformation.bIsOverThreshold, SeatInformation.CurrentThresholdScaler);
+		OnSeatThreshholdChanged_Bind.Broadcast(!SeatInformation.bIsOverThreshold, SeatInformation.CurrentThresholdScaler);
+	}
+}
+
+bool AVRBaseCharacter::SetSeatedMode(USceneComponent * SeatParent, bool bSetSeatedMode, FVector TargetLoc, float TargetYaw, float AllowedRadius, float AllowedRadiusThreshold, bool bZeroToHead)
+{
+	if (!this->HasAuthority() || !SeatParent)
+		return false;
+
+	if (bSetSeatedMode)
+	{
+		SeatInformation.SeatParent = SeatParent;
+		//SeatedCharacter.SeatedCharacter = CharacterToSeat;
+		SeatInformation.bSitting = true;
+		SeatInformation.StoredYaw = TargetYaw;
+		SeatInformation.StoredLocation = TargetLoc;
+		SeatInformation.AllowedRadius = AllowedRadius;
+		SeatInformation.AllowedRadiusThreshold = AllowedRadiusThreshold;
+
+		// Null out Z so we keep feet location if not zeroing to head
+		if (!bZeroToHead)
+			SeatInformation.StoredLocation.Z = 0.0f;
+
+		//SetReplicateMovement(false);/ / No longer doing this, allowing it to replicate down to simulated clients now instead
+	}
+	else
+	{
+		SeatInformation.SeatParent = nullptr;
+		SeatInformation.StoredYaw = TargetYaw;
+		SeatInformation.StoredLocation = TargetLoc;
+		//SetReplicateMovement(true); // No longer doing this, allowing it to replicate down to simulated clients now instead
+		SeatInformation.bSitting = false;
+	}
+
+	OnRep_SeatedCharInfo(); // Call this on server side because it won't call itself
+	NotifyOfTeleport(); // Teleport the controllers
+
+	return true;
+}
+
+void AVRBaseCharacter::SetSeatRelativeLocationAndRotationVR(FVector Pivot, FVector NewLoc, FRotator NewRot, bool bUseYawOnly)
+{
+	if (bUseYawOnly)
+	{
+		NewRot.Pitch = 0.0f;
+		NewRot.Roll = 0.0f;
+	}
+
+	NewLoc = NewLoc + Pivot;
+	NewLoc -= NewRot.RotateVector(Pivot);
+
+	SetActorRelativeTransform(FTransform(NewRot, NewLoc, GetCapsuleComponent()->RelativeScale3D));
+}
+
+
+FVector AVRBaseCharacter::AddActorWorldRotationVR(FRotator DeltaRot, bool bUseYawOnly)
+{
+	AController* OwningController = GetController();
+
+	FVector NewLocation;
+	FRotator NewRotation;
+	FVector OrigLocation = GetActorLocation();
+	FVector PivotPoint = GetActorTransform().InverseTransformPosition(GetVRLocation_Inline());
+	PivotPoint.Z = 0.0f;
+
+	NewRotation = bUseControllerRotationYaw && OwningController ? OwningController->GetControlRotation() : GetActorRotation();
+
+	if (bUseYawOnly)
+	{
+		NewRotation.Pitch = 0.0f;
+		NewRotation.Roll = 0.0f;
+	}
+
+	NewLocation = OrigLocation + NewRotation.RotateVector(PivotPoint);
+	NewRotation = (NewRotation.Quaternion() * DeltaRot.Quaternion()).Rotator();
+	NewLocation -= NewRotation.RotateVector(PivotPoint);
+
+	if (bUseControllerRotationYaw && OwningController /*&& IsLocallyControlled()*/)
+		OwningController->SetControlRotation(NewRotation);
+
+	// Also setting actor rot because the control rot transfers to it anyway eventually
+	SetActorLocationAndRotation(NewLocation, NewRotation);
+	return NewLocation - OrigLocation;
+}
+
+FVector AVRBaseCharacter::SetActorRotationVR(FRotator NewRot, bool bUseYawOnly, bool bAccountForHMDRotation)
+{
+	AController* OwningController = GetController();
+
+	FVector NewLocation;
+	FRotator NewRotation;
+	FVector OrigLocation = GetActorLocation();
+	FVector PivotPoint = GetActorTransform().InverseTransformPosition(GetVRLocation_Inline());
+	PivotPoint.Z = 0.0f;
+
+	FRotator OrigRotation = bUseControllerRotationYaw && OwningController ? OwningController->GetControlRotation() : GetActorRotation();
+
+	if (bUseYawOnly)
+	{
+		NewRot.Pitch = 0.0f;
+		NewRot.Roll = 0.0f;
+	}
+
+	if (bAccountForHMDRotation)
+	{
+		NewRotation = UVRExpansionFunctionLibrary::GetHMDPureYaw_I(VRReplicatedCamera->RelativeRotation);
+		NewRotation = (NewRot.Quaternion() * NewRotation.Quaternion().Inverse()).Rotator();
+	}
+	else
+		NewRotation = NewRot;
+
+	NewLocation = OrigLocation + OrigRotation.RotateVector(PivotPoint);
+	//NewRotation = NewRot;
+	NewLocation -= NewRotation.RotateVector(PivotPoint);
+
+	if (bUseControllerRotationYaw && OwningController /*&& IsLocallyControlled()*/)
+		OwningController->SetControlRotation(NewRotation);
+
+	// Also setting actor rot because the control rot transfers to it anyway eventually
+	SetActorLocationAndRotation(NewLocation, NewRotation);
+	return NewLocation - OrigLocation;
+}
+
+FVector AVRBaseCharacter::SetActorLocationAndRotationVR(FVector NewLoc, FRotator NewRot, bool bUseYawOnly, bool bAccountForHMDRotation, bool bTeleport)
+{
+	AController* OwningController = GetController();
+
+	FVector NewLocation;
+	FRotator NewRotation;
+	FVector PivotPoint = GetActorTransform().InverseTransformPosition(GetVRLocation_Inline());
+	PivotPoint.Z = 0.0f;
+
+	if (bUseYawOnly)
+	{
+		NewRot.Pitch = 0.0f;
+		NewRot.Roll = 0.0f;
+	}
+
+	if (bAccountForHMDRotation)
+	{
+		NewRotation = UVRExpansionFunctionLibrary::GetHMDPureYaw_I(VRReplicatedCamera->RelativeRotation);//bUseControllerRotationYaw && OwningController ? OwningController->GetControlRotation() : GetActorRotation();
+		NewRotation = (NewRotation.Quaternion().Inverse() * NewRot.Quaternion()).Rotator();
+	}
+	else
+		NewRotation = NewRot;
+
+	NewLocation = NewLoc;// +PivotPoint;// NewRotation.RotateVector(PivotPoint);
+						 //NewRotation = NewRot;
+	NewLocation -= NewRotation.RotateVector(PivotPoint);
+
+	if (bUseControllerRotationYaw && OwningController /*&& IsLocallyControlled()*/)
+		OwningController->SetControlRotation(NewRotation);
+
+	// Also setting actor rot because the control rot transfers to it anyway eventually
+	SetActorLocationAndRotation(NewLocation, NewRotation, false, nullptr, bTeleport ? ETeleportType::TeleportPhysics : ETeleportType::None);
+	return NewLocation - NewLoc;
+}
+
+void AVRBaseCharacter::SetCharacterSizeVR(float NewRadius, float NewHalfHeight, bool bUpdateOverlaps)
+{
+	if (UCapsuleComponent * Capsule = Cast<UCapsuleComponent>(this->RootComponent))
+	{
+		if (!FMath::IsNearlyEqual(NewRadius, Capsule->GetUnscaledCapsuleRadius()) || !FMath::IsNearlyEqual(NewHalfHeight, Capsule->GetUnscaledCapsuleHalfHeight()))
+			Capsule->SetCapsuleSize(NewRadius, NewHalfHeight, bUpdateOverlaps);
+
+		if (GetNetMode() < ENetMode::NM_Client && VRReplicateCapsuleHeight)
+			ReplicatedCapsuleHeight.CapsuleHeight = Capsule->GetUnscaledCapsuleHalfHeight();
+	}
+}
+
+void AVRBaseCharacter::SetCharacterHalfHeightVR(float HalfHeight, bool bUpdateOverlaps)
+{
+	if (UCapsuleComponent * Capsule = Cast<UCapsuleComponent>(this->RootComponent))
+	{
+		if (!FMath::IsNearlyEqual(HalfHeight, Capsule->GetUnscaledCapsuleHalfHeight()))
+			Capsule->SetCapsuleHalfHeight(HalfHeight, bUpdateOverlaps);
+
+		if (GetNetMode() < ENetMode::NM_Client && VRReplicateCapsuleHeight)
+			ReplicatedCapsuleHeight.CapsuleHeight = Capsule->GetUnscaledCapsuleHalfHeight();
 	}
 }
 

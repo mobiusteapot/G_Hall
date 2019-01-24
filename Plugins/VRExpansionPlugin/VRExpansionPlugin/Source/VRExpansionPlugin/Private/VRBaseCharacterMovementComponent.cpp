@@ -12,7 +12,6 @@
 #include "VRPlayerController.h"
 #include "GameFramework/PhysicsVolume.h"
 
-
 UVRBaseCharacterMovementComponent::UVRBaseCharacterMovementComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -35,6 +34,9 @@ UVRBaseCharacterMovementComponent::UVRBaseCharacterMovementComponent(const FObje
 	VRClimbingStepHeight = 96.0f;
 	VRClimbingEdgeRejectDistance = 5.0f;
 	VRClimbingStepUpMultiplier = 1.0f;
+	bClampClimbingStepUp = false;
+	VRClimbingStepUpMaxSize = 20.0f;
+
 	VRClimbingMaxReleaseVelocitySize = 800.0f;
 	SetDefaultPostClimbMovementOnStepUp = true;
 	DefaultPostClimbMovement = EVRConjoinedMovementModes::C_MOVE_Falling;
@@ -88,7 +90,6 @@ void UVRBaseCharacterMovementComponent::TickComponent(float DeltaTime, enum ELev
 			}
 
 		}
-
 	}
 	else
 		Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
@@ -131,6 +132,26 @@ void UVRBaseCharacterMovementComponent::EndPushBackNotification()
 	if (AVRBaseCharacter * OwningCharacter = Cast<AVRBaseCharacter>(GetCharacterOwner()))
 	{
 		OwningCharacter->OnEndWallPushback();
+	}
+}
+
+FVector UVRBaseCharacterMovementComponent::GetActorFeetLocationVR() const
+{
+	if (AVRBaseCharacter * BaseCharacter = Cast<AVRBaseCharacter>(GetCharacterOwner()))
+	{
+		return UpdatedComponent ? (BaseCharacter->OffsetComponentToWorld.GetLocation() - FVector(0, 0, UpdatedComponent->Bounds.BoxExtent.Z)) : FNavigationSystem::InvalidLocation;
+	}
+	else
+	{
+		return UpdatedComponent ? (UpdatedComponent->GetComponentLocation() - FVector(0, 0, UpdatedComponent->Bounds.BoxExtent.Z)) : FNavigationSystem::InvalidLocation;
+	}
+}
+
+void UVRBaseCharacterMovementComponent::OnMoveCompleted(FAIRequestID RequestID, const FPathFollowingResult& Result)
+{
+	if (AVRBaseCharacter* vrOwner = Cast<AVRBaseCharacter>(GetCharacterOwner()))
+	{
+		vrOwner->NavigationMoveCompleted(RequestID, Result);
 	}
 }
 
@@ -482,7 +503,9 @@ void UVRBaseCharacterMovementComponent::PerformMoveAction_Custom(EVRMoveAction M
 {
 	FVRMoveActionContainer MoveAction;
 	MoveAction.MoveAction = MoveActionToPerform;
-	MoveAction.MoveActionLoc = MoveActionVector;
+
+	// Round the vector to 2 decimal precision
+	MoveAction.MoveActionLoc = RoundDirectMovement(MoveActionVector);
 	MoveAction.MoveActionRot = MoveActionRotator;
 	MoveAction.MoveActionDataReq = DataRequirementsForMoveAction;
 	MoveActionArray.MoveActions.Add(MoveAction);
@@ -612,11 +635,8 @@ void UVRBaseCharacterMovementComponent::PhysCustom_Climbing(float deltaTime, int
 	// I am forcing this to 0 to avoid some legacy velocity coming out of other movement modes, climbing should only be direct movement anyway.
 	Velocity = FVector::ZeroVector;
 
-	if (bApplyAdditionalVRInputVectorAsNegative)
-	{
-		// Rewind the players position by the new capsule location
-		RewindVRRelativeMovement();
-	}
+	// Rewind the players position by the new capsule location
+	RewindVRRelativeMovement();
 
 	Iterations++;
 	bJustTeleported = false;
@@ -648,15 +668,36 @@ void UVRBaseCharacterMovementComponent::PhysCustom_Climbing(float deltaTime, int
 			//bool bSteppedUp = false;
 			if ((FMath::Abs(Hit.ImpactNormal.Z) < 0.2f) && (UpDown < 0.5f) && (UpDown > -0.2f) && CanStepUp(Hit))
 			{
-				float stepZ = UpdatedComponent->GetComponentLocation().Z;
+				// Scope our movement updates, and do not apply them until all intermediate moves are completed.
+				FVRCharacterScopedMovementUpdate ScopedStepUpMovement(UpdatedComponent, EScopedUpdate::DeferredUpdates);
 
+				float stepZ = UpdatedComponent->GetComponentLocation().Z;
+				
 				// Making it easier to step up here with the multiplier, helps avoid falling back off
-				bSteppedUp = VRClimbStepUp(GravDir, ((Adjusted * VRClimbingStepUpMultiplier) + AdditionalVRInputVector) * (1.f - Hit.Time), Hit, &StepDownResult);
+					if(bClampClimbingStepUp)
+						bSteppedUp = VRClimbStepUp(GravDir, ((Adjusted.GetClampedToMaxSize2D(VRClimbingStepUpMaxSize) * VRClimbingStepUpMultiplier) + AdditionalVRInputVector) * (1.f - Hit.Time), Hit, &StepDownResult);
+					else
+						bSteppedUp = VRClimbStepUp(GravDir, ((Adjusted * VRClimbingStepUpMultiplier) + AdditionalVRInputVector) * (1.f - Hit.Time), Hit, &StepDownResult);
+
+				if (bSteppedUp && OnPerformClimbingStepUp.IsBound())
+				{
+					FVector finalLoc = UpdatedComponent->GetComponentLocation();
+
+					// Rewind the step up, the end user wants to handle it instead
+					ScopedStepUpMovement.RevertMove();
+
+					// Revert to old max step height
+					MaxStepHeight = OldMaxStepHeight;
+					
+					OnPerformClimbingStepUp.Broadcast(finalLoc);
+					return;
+				}
 
 				if (bSteppedUp)
 				{
 					OldLocation.Z = UpdatedComponent->GetComponentLocation().Z + (OldLocation.Z - stepZ);
 				}
+			
 			}
 
 			if (!bSteppedUp)
@@ -746,11 +787,8 @@ void UVRBaseCharacterMovementComponent::PhysCustom_LowGrav(float deltaTime, int3
 
 	CalcVelocity(deltaTime, Friction, true, 0.0f);
 
-	if (bApplyAdditionalVRInputVectorAsNegative)
-	{
-		// Rewind the players position by the new capsule location
-		RewindVRRelativeMovement();
-	}
+	// Rewind the players position by the new capsule location
+	RewindVRRelativeMovement();
 
 	// Adding in custom VR input vector here, can be used for custom movement during it
 	// AddImpulse is not multiplayer compatible client side
@@ -818,6 +856,40 @@ void UVRBaseCharacterMovementComponent::SetReplicatedMovementMode(EVRConjoinedMo
 	VRReplicatedMovementMode = NewMovementMode;
 }
 
+EVRConjoinedMovementModes UVRBaseCharacterMovementComponent::GetReplicatedMovementMode()
+{
+	if (MovementMode == EMovementMode::MOVE_Custom)
+	{
+		return (EVRConjoinedMovementModes)((int8)CustomMovementMode + (int8)EVRConjoinedMovementModes::C_VRMOVE_Climbing);
+	}
+	else
+		return (EVRConjoinedMovementModes)MovementMode.GetValue();
+}
+
+void UVRBaseCharacterMovementComponent::ApplyNetworkMovementMode(const uint8 ReceivedMode)
+{
+	if (CharacterOwner->Role != ENetRole::ROLE_SimulatedProxy)
+	{
+		const uint8 CurrentPackedMovementMode = PackNetworkMovementMode();
+		if (CurrentPackedMovementMode != ReceivedMode)
+		{
+			TEnumAsByte<EMovementMode> NetMovementMode(MOVE_None);
+			TEnumAsByte<EMovementMode> NetGroundMode(MOVE_None);
+			uint8 NetCustomMode(0);
+			UnpackNetworkMovementMode(ReceivedMode, NetMovementMode, NetCustomMode, NetGroundMode);
+
+			// Custom movement modes aren't going to be rolled back as they are client authed for our pawns
+			if (NetMovementMode == EMovementMode::MOVE_Custom || MovementMode == EMovementMode::MOVE_Custom)
+			{
+				if (NetCustomMode == (uint8)EVRCustomMovementMode::VRMOVE_Climbing || CustomMovementMode == (uint8)EVRCustomMovementMode::VRMOVE_Climbing)
+				return; // Don't rollback custom movement modes, we set the server to trust the client on them now so the server should get corrected
+			}
+		}
+	}
+	
+	Super::ApplyNetworkMovementMode(ReceivedMode);
+}
+
 /*void UVRBaseCharacterMovementComponent::SendClientAdjustment()
 {
 	if (!HasValidData())
@@ -883,7 +955,7 @@ void UVRBaseCharacterMovementComponent::SetReplicatedMovementMode(EVRConjoinedMo
 		{
 			if (AVRBaseCharacter * VRC = Cast<AVRBaseCharacter>(GetOwner()))
 			{
-				FVector CusVec = VRC->GetVRLocation();
+				FVector CusVec = VRC->GetVRLocation_Inline();
 				GEngine->AddOnScreenDebugMessage(-1, 125.f, IsLocallyControlled() ? FColor::Red : FColor::Green, FString::Printf(TEXT("VrLoc: x: %f, y: %f, X: %f"), CusVec.X, CusVec.Y, CusVec.Z));
 			}
 			GEngine->AddOnScreenDebugMessage(-1, 125.f, FColor::Red, TEXT("Correcting Client Location!"));
@@ -902,7 +974,7 @@ void UVRBaseCharacterMovementComponent::SetReplicatedMovementMode(EVRConjoinedMo
 		{
 			if (AVRBaseCharacter * VRC = Cast<AVRBaseCharacter>(GetOwner()))
 			{
-				FVector CusVec = VRC->GetVRLocation();
+				FVector CusVec = VRC->GetVRLocation_Inline();
 				GEngine->AddOnScreenDebugMessage(-1, 125.f, IsLocallyControlled() ? FColor::Red : FColor::Green, FString::Printf(TEXT("VrLoc: x: %f, y: %f, X: %f"), CusVec.X, CusVec.Y, CusVec.Z));
 			}
 			GEngine->AddOnScreenDebugMessage(-1, 125.f, FColor::Red, TEXT("Correcting Client Location!"));
@@ -1240,8 +1312,11 @@ void UVRBaseCharacterMovementComponent::SmoothCorrection(const FVector& OldLocat
 
 			// Move the capsule, but not the mesh.
 			// Note: we don't change rotation, we lerp towards it in SmoothClientPosition.
-			const FScopedPreventAttachedComponentMove PreventMeshMove(Basechar->NetSmoother);
-			UpdatedComponent->SetWorldLocation(NewLocation, false, nullptr, GetTeleportType());
+			if (NewLocation != OldLocation)
+			{
+				const FScopedPreventAttachedComponentMove PreventMeshMove(CharacterOwner->GetMesh());
+				UpdatedComponent->SetWorldLocation(NewLocation, false, nullptr, GetTeleportType());
+			}
 		}
 		else
 		{

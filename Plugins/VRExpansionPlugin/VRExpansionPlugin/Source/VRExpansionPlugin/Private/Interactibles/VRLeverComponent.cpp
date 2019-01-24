@@ -1,6 +1,6 @@
 // Copyright 1998-2016 Epic Games, Inc. All Rights Reserved.
 
-#include "VRLeverComponent.h"
+#include "Interactibles/VRLeverComponent.h"
 #include "Net/UnrealNetwork.h"
 
   //=============================================================================
@@ -20,7 +20,7 @@ UVRLeverComponent::UVRLeverComponent(const FObjectInitializer& ObjectInitializer
 	Damping = 200.0f;
 
 	HandleData = nullptr;
-	SceneIndex = 0;
+	//SceneIndex = 0;
 
 	bIsPhysicsLever = false;
 	ParentComponent = nullptr;
@@ -108,6 +108,8 @@ void UVRLeverComponent::TickComponent(float DeltaTime, enum ELevelTick TickType,
 	// Call supers tick (though I don't think any of the base classes to this actually implement it)
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
+	bool bWasLerping = bIsLerping;
+
 	if (bIsLerping)
 	{
 		FTransform CurRelativeTransform = this->GetComponentTransform().GetRelativeTransform(GetCurrentParentTransform());
@@ -130,6 +132,7 @@ void UVRLeverComponent::TickComponent(float DeltaTime, enum ELevelTick TickType,
 			if (LerpedRot.Equals(FRotator::ZeroRotator))
 			{
 				this->SetComponentTickEnabled(false);
+				bIsLerping = false;
 				bReplicateMovement = true;
 				this->SetRelativeRotation((FTransform::Identity * InitialRelativeTransform).Rotator());
 			}
@@ -144,7 +147,7 @@ void UVRLeverComponent::TickComponent(float DeltaTime, enum ELevelTick TickType,
 
 	CalculateCurrentAngle(CurrentRelativeTransform);
 
-	if (!bIsLerping && LeverReturnTypeWhenReleased == EVRInteractibleLeverReturnType::RetainMomentum)
+	if (!bWasLerping && LeverReturnTypeWhenReleased == EVRInteractibleLeverReturnType::RetainMomentum)
 	{
 		// Rolling average across num samples
 		MomentumAtDrop -= MomentumAtDrop / FramesToAverage;
@@ -161,13 +164,13 @@ void UVRLeverComponent::TickComponent(float DeltaTime, enum ELevelTick TickType,
 	{
 		bLeverState = bNewLeverState;
 
-		if (bSendLeverEventsDuringLerp || !bIsLerping)
+		if (bSendLeverEventsDuringLerp || !bWasLerping)
 		{
 			ReceiveLeverStateChanged(bLeverState, FullCurrentAngle >= 0.0f ? EVRInteractibleLeverEventType::LeverPositive : EVRInteractibleLeverEventType::LeverNegative, FullCurrentAngle);
 			OnLeverStateChanged.Broadcast(bLeverState, FullCurrentAngle >= 0.0f ? EVRInteractibleLeverEventType::LeverPositive : EVRInteractibleLeverEventType::LeverNegative, FullCurrentAngle);
 		}
 
-		if (!bIsLerping && bUngripAtTargetRotation && bLeverState && HoldingController)
+		if (!bWasLerping && bUngripAtTargetRotation && bLeverState && HoldingController)
 		{
 			FBPActorGripInformation GripInformation;
 			EBPVRResultSwitch result;
@@ -177,6 +180,13 @@ void UVRLeverComponent::TickComponent(float DeltaTime, enum ELevelTick TickType,
 				HoldingController->DropObjectByInterface(this);
 			}
 		}
+	}
+
+	// If the lerping state changed from the above
+	if (bWasLerping && !bIsLerping)
+	{
+		OnLeverFinishedLerping.Broadcast(CurrentLeverAngle);
+		ReceiveLeverFinishedLerping(CurrentLeverAngle);
 	}
 }
 
@@ -191,7 +201,7 @@ void UVRLeverComponent::TickGrip_Implementation(UGripMotionControllerComponent *
 	// Handle manual tracking here
 
 	FTransform CurrentRelativeTransform = InitialRelativeTransform * GetCurrentParentTransform();
-	FVector CurInteractorLocation = CurrentRelativeTransform.InverseTransformPosition(GrippingController->GetComponentLocation());
+	FVector CurInteractorLocation = CurrentRelativeTransform.InverseTransformPosition(GrippingController->GetPivotLocation());
 
 	switch (LeverRotationAxis)
 	{
@@ -248,7 +258,7 @@ void UVRLeverComponent::TickGrip_Implementation(UGripMotionControllerComponent *
 	}
 
 	// Also set it to after rotation
-	if (GrippingController->HasGripAuthority(GripInformation) && FVector::DistSquared(InitialInteractorDropLocation, this->GetComponentTransform().InverseTransformPosition(GrippingController->GetComponentLocation())) >= FMath::Square(BreakDistance))
+	if (BreakDistance > 0.f && GrippingController->HasGripAuthority(GripInformation) && FVector::DistSquared(InitialInteractorDropLocation, this->GetComponentTransform().InverseTransformPosition(GrippingController->GetPivotLocation())) >= FMath::Square(BreakDistance))
 	{
 		GrippingController->DropObjectByInterface(this);
 		return;
@@ -464,3 +474,8 @@ void UVRLeverComponent::SetHeld_Implementation(UGripMotionControllerComponent * 
 {
 	return FBPInteractionSettings();
 }*/
+
+bool UVRLeverComponent::GetGripScripts_Implementation(TArray<UVRGripScriptBase*> & ArrayReference)
+{
+	return false;
+}

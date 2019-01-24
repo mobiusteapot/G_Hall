@@ -579,6 +579,9 @@ void UVRCharacterMovementComponent::ServerMoveVR_Implementation(
 	FVRConditionalMoveRep2 MoveReps,
 	uint8 ClientMovementMode)
 {
+
+
+
 	if (!HasValidData() || !IsComponentTickEnabled())
 	{
 		return;
@@ -694,6 +697,24 @@ void UVRCharacterMovementComponent::ServerMoveVR_Implementation(
 	UE_LOG(LogVRCharacterMovement, Verbose, TEXT("ServerMove Time %f Acceleration %s Position %s DeltaTime %f"),
 		TimeStamp, *Accel.ToString(), *UpdatedComponent->GetComponentLocation().ToString(), DeltaTime);
 
+	// #TODO: Handle this better at some point? Client also denies it later on during correction (ApplyNetworkMovementMode in base movement)
+	// Pre handling the errors, lets avoid rolling back to/from custom movement modes, they tend to be scripted and this can screw things up
+	const uint8 CurrentPackedMovementMode = PackNetworkMovementMode();
+	if (CurrentPackedMovementMode != ClientMovementMode)
+	{
+		TEnumAsByte<EMovementMode> NetMovementMode(MOVE_None);
+		TEnumAsByte<EMovementMode> NetGroundMode(MOVE_None);
+		uint8 NetCustomMode(0);
+		UnpackNetworkMovementMode(ClientMovementMode, NetMovementMode, NetCustomMode, NetGroundMode);
+
+		// Custom movement modes aren't going to be rolled back as they are client authed for our pawns
+		if (NetMovementMode == EMovementMode::MOVE_Custom || MovementMode == EMovementMode::MOVE_Custom)
+		{
+			if(NetCustomMode == (uint8)EVRCustomMovementMode::VRMOVE_Climbing || CustomMovementMode == (uint8)EVRCustomMovementMode::VRMOVE_Climbing)
+				SetMovementMode(NetMovementMode, NetCustomMode);
+		}
+	}
+
 	ServerMoveHandleClientErrorVR(TimeStamp, DeltaTime, Accel, ClientLoc, ViewRot.Yaw, MoveReps.ClientMovementBase, MoveReps.ClientBaseBoneName, ClientMovementMode);
 }
 
@@ -704,7 +725,6 @@ void UVRCharacterMovementComponent::CallServerMove
 	const class FSavedMove_Character* OldCMove
 	)
 {
-
 	// This is technically "safe", I know for sure that I am using my own FSavedMove
 	// I would have like to not override any of this, but I need a lot more specific information about the pawn
 	// So just setting flags in the FSaved Move doesn't cut it
@@ -876,13 +896,7 @@ void UVRCharacterMovementComponent::CallServerMove
 		}
 	}
 
-
-	APlayerController* PC = Cast<APlayerController>(CharacterOwner->GetController());
-	APlayerCameraManager* PlayerCameraManager = (PC ? PC->PlayerCameraManager : NULL);
-	if (PlayerCameraManager != NULL && PlayerCameraManager->bUseClientSideCameraUpdates)
-	{
-		PlayerCameraManager->bShouldSendClientSideCameraUpdate = true;
-	}
+	MarkForClientCameraUpdate();
 }
 
 
@@ -996,7 +1010,7 @@ void UVRCharacterMovementComponent::PhysWalking(float deltaTime, int32 Iteration
 		}
 
 		//ApplyRootMotionToVelocity(timeTick);
-		ApplyVRMotionToVelocity(timeTick);
+		ApplyVRMotionToVelocity(deltaTime);//timeTick);
 
 		devCode(ensureMsgf(!Velocity.ContainsNaN(), TEXT("PhysWalking: Velocity contains NaN after Root Motion application (%s)\n%s"), *GetPathNameSafe(this), *Velocity.ToString()));
 
@@ -1391,22 +1405,44 @@ void UVRCharacterMovementComponent::ReplicateMoveToServer(float DeltaTime, const
 				return;
 			}
 		}
-
-		// Remove 4.16
-		//ClientData->ClientUpdateTime = GetWorld()->TimeSeconds;
 		
 		// Uncomment 4.16
 		ClientData->ClientUpdateTime = MyWorld->TimeSeconds;
 
-		UE_LOG(LogVRCharacterMovement, Verbose, TEXT("Client ReplicateMove Time %f Acceleration %s Position %s DeltaTime %f"),
-			NewMove->TimeStamp, *NewMove->Acceleration.ToString(), *UpdatedComponent->GetComponentLocation().ToString(), DeltaTime);
+		/*UE_LOG(LogVRCharacterMovement, Verbose, TEXT("Client ReplicateMove Time %f Acceleration %s Position %s DeltaTime %f"),
+			NewMove->TimeStamp, *NewMove->Acceleration.ToString(), *UpdatedComponent->GetComponentLocation().ToString(), DeltaTime);*/
+		UE_CLOG(CharacterOwner && UpdatedComponent, LogVRCharacterMovement, Verbose, TEXT("ClientMove Time %f Acceleration %s Velocity %s Position %s DeltaTime %f Mode %s MovementBase %s.%s (Dynamic:%d) DualMove? %d"),
+			NewMove->TimeStamp, *NewMove->Acceleration.ToString(), *Velocity.ToString(), *UpdatedComponent->GetComponentLocation().ToString(), NewMove->DeltaTime, *GetMovementName(),
+			*GetNameSafe(NewMove->EndBase.Get()), *NewMove->EndBoneName.ToString(), MovementBaseUtility::IsDynamicBase(NewMove->EndBase.Get()) ? 1 : 0, ClientData->PendingMove.IsValid() ? 1 : 0);
+
+
+		bool bSendServerMove = true;
+
+#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+
+		// Testing options: Simulated packet loss to server
+		const float TimeSinceLossStart = (MyWorld->RealTimeSeconds - ClientData->DebugForcedPacketLossTimerStart);
+
+		static const auto CVarNetForceClientServerMoveLossDuration = IConsoleManager::Get().FindConsoleVariable(TEXT("p.NetForceClientServerMoveLossDuration"));
+		static const auto CVarNetForceClientServerMoveLossPercent = IConsoleManager::Get().FindConsoleVariable(TEXT("p.NetForceClientServerMoveLossPercent"));
+		if (ClientData->DebugForcedPacketLossTimerStart > 0.f && (TimeSinceLossStart < CVarNetForceClientServerMoveLossDuration->GetFloat()))
+		{
+			bSendServerMove = false;
+			UE_LOG(LogVRCharacterMovement, Log, TEXT("Drop ServerMove, %.2f time remains"), CVarNetForceClientServerMoveLossDuration->GetFloat() - TimeSinceLossStart);
+		}
+		else if (CVarNetForceClientServerMoveLossPercent->GetFloat() != 0.f && (FMath::SRand() < CVarNetForceClientServerMoveLossPercent->GetFloat()))
+		{
+			bSendServerMove = false;
+			ClientData->DebugForcedPacketLossTimerStart = (CVarNetForceClientServerMoveLossDuration->GetFloat() > 0) ? MyWorld->RealTimeSeconds : 0.0f;
+			UE_LOG(LogVRCharacterMovement, Log, TEXT("Drop ServerMove, %.2f time remains"), CVarNetForceClientServerMoveLossDuration->GetFloat());
+		}
+		else
+		{
+			ClientData->DebugForcedPacketLossTimerStart = 0.f;
+		}
+#endif
 
 		// Send move to server if this character is replicating movement
-		bool bSendServerMove = true;
-#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
-		static const auto CVarNetForceClientServerMoveLossPercent = IConsoleManager::Get().FindConsoleVariable(TEXT("p.NetForceClientServerMoveLossPercent"));
-		bSendServerMove = (CVarNetForceClientServerMoveLossPercent->GetFloat() == 0.f) || (FMath::SRand() >= CVarNetForceClientServerMoveLossPercent->GetFloat());
-#endif
 		if (bSendServerMove)
 		{
 			SCOPE_CYCLE_COUNTER(STAT_CharacterMovementCallServerMove);
@@ -2337,7 +2373,7 @@ FVector UVRCharacterMovementComponent::GetImpartedMovementBaseVelocity() const
 
 
 
-void UVRCharacterMovementComponent::FindFloor(const FVector& CapsuleLocation, FFindFloorResult& OutFloorResult, bool bZeroDelta, const FHitResult* DownwardSweepResult) const
+void UVRCharacterMovementComponent::FindFloor(const FVector& CapsuleLocation, FFindFloorResult& OutFloorResult, bool bCanUseCachedLocation, const FHitResult* DownwardSweepResult) const
 {
 	SCOPE_CYCLE_COUNTER(STAT_CharFindFloor);
 	//UE_LOG(LogVRCharacterMovement, Warning, TEXT("Find Floor"));
@@ -2370,7 +2406,7 @@ void UVRCharacterMovementComponent::FindFloor(const FVector& CapsuleLocation, FF
 	{
 		UCharacterMovementComponent* MutableThis = const_cast<UCharacterMovementComponent*>((UCharacterMovementComponent*)this);
 
-		if (bAlwaysCheckFloor || !bZeroDelta || bForceNextFloorCheck || bJustTeleported)
+		if (bAlwaysCheckFloor || !bCanUseCachedLocation || bForceNextFloorCheck || bJustTeleported)
 		{
 			MutableThis->bForceNextFloorCheck = false;
 			ComputeFloorDist(UseCapsuleLocation, FloorLineTraceDist, FloorSweepTraceDist, OutFloorResult, CharacterOwner->GetCapsuleComponent()->GetScaledCapsuleRadius(), DownwardSweepResult);
@@ -2598,7 +2634,7 @@ float UVRCharacterMovementComponent::ImmersionDepth() const
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 	FVector TopOfCapsule;
 	if (VRRootCapsule)
-		TopOfCapsule = VRRootCapsule->GetVRLocation();
+		TopOfCapsule = VRRootCapsule->GetVRLocation_Inline();
 	else
 		TopOfCapsule = GetActorLocation();
 
@@ -2685,14 +2721,6 @@ float UVRCharacterMovementComponent::ImmersionDepth() const
 ///////////////////////////
 // Navigation Functions
 ///////////////////////////
-
-void UVRCharacterMovementComponent::OnMoveCompleted(FAIRequestID RequestID, const FPathFollowingResult& Result)
-{
-	if (AVRCharacter* vrOwner = Cast<AVRCharacter>(GetCharacterOwner()))
-	{
-		vrOwner->NavigationMoveCompleted(RequestID, Result);
-	}
-}
 
 bool UVRCharacterMovementComponent::TryToLeaveNavWalking()
 {
@@ -3169,7 +3197,7 @@ void UVRCharacterMovementComponent::PhysNavWalking(float deltaTime, int32 Iterat
 	DesiredMove.Z = 0.f;
 
 	//const FVector OldPlayerLocation = GetActorFeetLocation();
-	const FVector OldLocation = GetActorFeetLocation();
+	const FVector OldLocation = GetActorFeetLocationVR();
 	const FVector DeltaMove = DesiredMove * deltaTime;
 
 	FVector AdjustedDest = OldLocation + DeltaMove;
@@ -3255,7 +3283,7 @@ void UVRCharacterMovementComponent::PhysNavWalking(float deltaTime, int32 Iterat
 		// Update velocity to reflect actual move
 		if (!bJustTeleported /*&& !HasRootMotion()*/)
 		{
-			Velocity = (GetActorFeetLocation() - OldLocation) / deltaTime;
+			Velocity = (GetActorFeetLocationVR() - OldLocation) / deltaTime;
 			MaintainHorizontalGroundVelocity();
 		}
 
@@ -3496,7 +3524,10 @@ bool UVRCharacterMovementComponent::CheckWaterJump(FVector CheckPoint, FVector& 
 	return false;
 }
 
-
+FBasedPosition UVRCharacterMovementComponent::GetActorFeetLocationBased() const
+{
+	return FBasedPosition(NULL, GetActorFeetLocationVR());
+}
 
 void UVRCharacterMovementComponent::ProcessLanded(const FHitResult& Hit, float remainingTime, int32 Iterations)
 {
@@ -3515,7 +3546,7 @@ void UVRCharacterMovementComponent::ProcessLanded(const FHitResult& Hit, float r
 			// otherwise movement will be stuck in infinite loop:
 			// navwalking -> (no navmesh) -> falling -> (standing on something) -> navwalking -> ....
 
-			const FVector TestLocation = GetActorFeetLocation();
+			const FVector TestLocation = GetActorFeetLocationVR();
 			FNavLocation NavLocation;
 
 			const bool bHasNavigationData = FindNavFloor(TestLocation, NavLocation);
@@ -3614,15 +3645,27 @@ void UVRCharacterMovementComponent::SimulateMovement(float DeltaSeconds)
 			}
 		}
 
+		if (MovementMode != MOVE_None)
+		{
+			//TODO: Also ApplyAccumulatedForces()?
+			HandlePendingLaunch();
+		}
+		ClearAccumulatedForces();
+
 		if (MovementMode == MOVE_None)
 		{
-			ClearAccumulatedForces();
 			return;
 		}
 
-		//TODO: Also ApplyAccumulatedForces()?
-		HandlePendingLaunch();
-		ClearAccumulatedForces();
+		const bool bSimGravityDisabled = (bIsSimulatedProxy && CharacterOwner->bSimGravityDisabled);
+		const bool bZeroReplicatedGroundVelocity = (bIsSimulatedProxy && IsMovingOnGround() && CharacterOwner->ReplicatedMovement.LinearVelocity.IsZero());
+
+		// bSimGravityDisabled means velocity was zero when replicated and we were stuck in something. Avoid external changes in velocity as well.
+		// Being in ground movement with zero velocity, we cannot simulate proxy velocities safely because we might not get any further updates from the server.
+		if (bSimGravityDisabled || bZeroReplicatedGroundVelocity)
+		{
+			Velocity = FVector::ZeroVector;
+		}
 
 		Acceleration = Velocity.GetSafeNormal();	// Not currently used for simulated movement
 		AnalogInputModifier = 1.0f;				// Not currently used for simulated movement
@@ -3644,7 +3687,6 @@ void UVRCharacterMovementComponent::SimulateMovement(float DeltaSeconds)
 			// find floor and check if falling
 			if (IsMovingOnGround() || MovementMode == MOVE_Falling)
 			{
-				const bool bSimGravityDisabled = (CharacterOwner->bSimGravityDisabled && bIsSimulatedProxy);
 				if (StepDownResult.bComputedFloor)
 				{
 					CurrentFloor = StepDownResult.FloorResult;
@@ -3712,7 +3754,7 @@ void UVRCharacterMovementComponent::SimulateMovement(float DeltaSeconds)
 	  // Call custom post-movement events. These happen after the scoped movement completes in case the events want to use the current state of overlaps etc.
 	CallMovementUpdateDelegate(DeltaSeconds, OldLocation, OldVelocity);
 
-	MaybeSaveBaseLocation();
+	SaveBaseLocation();
 	UpdateComponentVelocity();
 	bJustTeleported = false;
 
@@ -4018,7 +4060,7 @@ void UVRCharacterMovementComponent::ClientAdjustPositionVR_Implementation
 
 
 	// Trigger event
-	OnClientCorrectionReceived(*ClientData, TimeStamp, NewLocation, NewVelocity, NewBase, NewBaseBoneName, bHasBase, bBaseRelativePosition, ServerMovementMode);
+	OnClientCorrectionReceived(*ClientData, TimeStamp, WorldShiftedNewLocation, NewVelocity, NewBase, NewBaseBoneName, bHasBase, bBaseRelativePosition, ServerMovementMode);
 
 	// Trust the server's positioning.
 	UpdatedComponent->SetWorldLocation(WorldShiftedNewLocation, false);
@@ -4085,10 +4127,12 @@ bool UVRCharacterMovementComponent::ServerCheckClientErrorVR(float ClientTimeSta
 			RootMotionSourceDebug::PrintOnScreen(*CharacterOwner, AdjustedDebugString);
 		}
 #endif
-		if (GetDefault<AGameNetworkManager>()->ExceedsAllowablePositionError(LocDiff))
+		const AGameNetworkManager* GameNetworkManager = (const AGameNetworkManager*)(AGameNetworkManager::StaticClass()->GetDefaultObject());
+		if (GameNetworkManager->ExceedsAllowablePositionError(LocDiff))
 		{
 			bNetworkLargeClientCorrection = (LocDiff.SizeSquared() > FMath::Square(NetworkLargeClientCorrectionDistance));
 			return true;
+
 		}
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 		static const auto CVarNetForceClientAdjustmentPercent = IConsoleManager::Get().FindConsoleVariable(TEXT("p.NetForceClientAdjustmentPercent"));
@@ -4143,9 +4187,13 @@ void UVRCharacterMovementComponent::ServerMoveHandleClientErrorVR(float ClientTi
 	// Don't prevent more recent updates from being sent if received this frame.
 	// We're going to send out an update anyway, might as well be the most recent one.
 	APlayerController* PC = Cast<APlayerController>(CharacterOwner->GetController());
-	if ((ServerData->LastUpdateTime != GetWorld()->TimeSeconds) && GetDefault<AGameNetworkManager>()->WithinUpdateDelayBounds(PC, ServerData->LastUpdateTime))
+	if ((ServerData->LastUpdateTime != GetWorld()->TimeSeconds))
 	{
-		return;
+		const AGameNetworkManager* GameNetworkManager = (const AGameNetworkManager*)(AGameNetworkManager::StaticClass()->GetDefaultObject());
+		if (GameNetworkManager->WithinUpdateDelayBounds(PC, ServerData->LastUpdateTime))
+		{
+			return;
+		}
 	}
 
 	// Offset may be relative to base component
@@ -4156,6 +4204,14 @@ void UVRCharacterMovementComponent::ServerMoveHandleClientErrorVR(float ClientTi
 		FQuat BaseRotation;
 		MovementBaseUtility::GetMovementBaseTransform(ClientMovementBase, ClientBaseBoneName, BaseLocation, BaseRotation);
 		ClientLoc += BaseLocation;
+	}
+
+	// Client may send a null movement base when walking on bases with no relative location (to save bandwidth).
+	// In this case don't check movement base in error conditions, use the server one (which avoids an error based on differing bases). Position will still be validated.
+	if (ClientMovementBase == nullptr && ClientMovementMode == MOVE_Walking)
+	{
+		ClientMovementBase = CharacterOwner->GetBasedMovement().MovementBase;
+		ClientBaseBoneName = CharacterOwner->GetBasedMovement().BoneName;
 	}
 
 	// Compute the client error from the server's position
@@ -4206,7 +4262,8 @@ void UVRCharacterMovementComponent::ServerMoveHandleClientErrorVR(float ClientTi
 	}
 	else
 	{
-		if (GetDefault<AGameNetworkManager>()->ClientAuthorativePosition)
+		const AGameNetworkManager* GameNetworkManager = (const AGameNetworkManager*)(AGameNetworkManager::StaticClass()->GetDefaultObject());
+		if (GameNetworkManager->ClientAuthorativePosition)
 		{
 			const FVector LocDiff = UpdatedComponent->GetComponentLocation() - ClientLoc; //-V595
 			if (!LocDiff.IsZero() || ClientMovementMode != PackNetworkMovementMode() || GetMovementBase() != ClientMovementBase || (CharacterOwner && CharacterOwner->GetBasedMovement().BoneName != ClientBaseBoneName))

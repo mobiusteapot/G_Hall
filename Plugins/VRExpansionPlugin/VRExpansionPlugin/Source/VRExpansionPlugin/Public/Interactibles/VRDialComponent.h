@@ -9,6 +9,7 @@
 #include "GameplayTagContainer.h"
 #include "GameplayTagAssetInterface.h"
 #include "VRInteractibleFunctionLibrary.h"
+#include "Components/StaticMeshComponent.h"
 
 
 #include "VRDialComponent.generated.h"
@@ -16,6 +17,7 @@
 
 /** Delegate for notification when the lever state changes. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVRDialStateChangedSignature, float, DialMilestoneAngle);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FVRDialFinishedLerpingSignature);
 
 UCLASS(Blueprintable, meta = (BlueprintSpawnableComponent), ClassGroup = (VRExpansionPlugin))
 class VREXPANSIONPLUGIN_API UVRDialComponent : public UStaticMeshComponent, public IVRGripInterface, public IGameplayTagAssetInterface
@@ -34,6 +36,25 @@ public:
 
 	UFUNCTION(BlueprintImplementableEvent, meta = (DisplayName = "Dial Hit Snap Angle"))
 		void ReceiveDialHitSnapAngle(float DialMilestoneAngle);
+
+	// If true the dial will lerp back to zero on release
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRDialComponent|Lerping")
+		bool bLerpBackOnRelease;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRDialComponent|Lerping")
+		bool bSendDialEventsDuringLerp;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRDialComponent|Lerping")
+		float DialReturnSpeed;
+
+	UPROPERTY(BlueprintReadOnly, Category = "VRDialComponent|Lerping")
+		bool bIsLerping;
+
+	UPROPERTY(BlueprintAssignable, Category = "VRDialComponent|Lerping")
+		FVRDialFinishedLerpingSignature OnDialFinishedLerping;
+
+	UFUNCTION(BlueprintImplementableEvent, meta = (DisplayName = "Dial Finished Lerping"))
+		void ReceiveDialFinishedLerping();
 
 	UPROPERTY(BlueprintReadOnly, Category = "VRDialComponent")
 	float CurrentDialAngle;
@@ -140,6 +161,14 @@ public:
 
 	}
 
+	// Directly sets the dial angle, still obeys maximum limits and snapping though
+	UFUNCTION(BlueprintCallable, Category = "VRLeverComponent")
+		void SetDialAngle(float DialAngle, bool bCallEvents = false)
+	{
+		CurRotBackEnd = DialAngle;
+		AddDialAngle(0.0f);
+	}
+
 	// ------------------------------------------------
 	// Gameplay tag interface
 	// ------------------------------------------------
@@ -173,16 +202,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
 		EGripMovementReplicationSettings MovementReplicationSetting;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
-		float BreakDistance;
-
 	UPROPERTY(BlueprintReadOnly, Category = "VRGripInterface")
 		bool bIsHeld; // Set on grip notify, not net serializing
 
 	UPROPERTY(BlueprintReadOnly, Category = "VRGripInterface")
 		UGripMotionControllerComponent * HoldingController; // Set on grip notify, not net serializing
+	
+															// Distance before the object will break out of the hand, 0.0f == never will
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
+		float BreakDistance;
 
-	UPROPERTY(BlueprintReadWrite, Category = "VRGripInterface")
+	// Should we deny gripping on this object
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
 		bool bDenyGripping;
 
 	// Grip interface setup
@@ -278,6 +309,10 @@ public:
 	// Get interactable settings
 	//UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
 		//FBPInteractionSettings GetInteractionSettings();
+
+	// Get grip scripts
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
+		bool GetGripScripts(TArray<UVRGripScriptBase*> & ArrayReference);
 
 
 	// Events //

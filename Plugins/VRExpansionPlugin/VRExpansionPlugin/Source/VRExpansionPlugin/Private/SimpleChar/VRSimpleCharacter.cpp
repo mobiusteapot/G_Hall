@@ -1,6 +1,6 @@
 // Copyright 1998-2016 Epic Games, Inc. All Rights Reserved.
 
-#include "VRSimpleCharacter.h"
+#include "SimpleChar/VRSimpleCharacter.h"
 //#include "Runtime/Engine/Private/EnginePrivate.h"
 
 AVRSimpleCharacter::AVRSimpleCharacter(const FObjectInitializer& ObjectInitializer)
@@ -90,7 +90,7 @@ void AVRSimpleCharacter::BeginPlay()
 
 FVector AVRSimpleCharacter::GetTeleportLocation(FVector OriginalLocation)
 {
-	//FVector modifier = VRRootReference->GetVRLocation() - this->GetActorLocation();
+	//FVector modifier = VRRootReference->GetVRLocation_Inline() - this->GetActorLocation();
 	//modifier.Z = 0.0f; // Null out Z
 	//return OriginalLocation - modifier;
 	

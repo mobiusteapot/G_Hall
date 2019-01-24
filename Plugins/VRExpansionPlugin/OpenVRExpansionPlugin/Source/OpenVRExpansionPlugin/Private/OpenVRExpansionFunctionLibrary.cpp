@@ -1,7 +1,10 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 #include "OpenVRExpansionFunctionLibrary.h"
-#include "Engine/Texture2D.h"
+//#include "EngineMinimal.h"
 #include "Engine/Engine.h"
+#include "CoreMinimal.h"
+#include "Engine/Texture2D.h"
+#include "RenderUtils.h"
 #include "IXRTrackingSystem.h"
 #include "IHeadMountedDisplay.h"
 
@@ -897,29 +900,32 @@ UTexture2D * UOpenVRExpansionFunctionLibrary::GetVRDeviceModelAndTexture(UObject
 
 	vr::TextureID_t texID = RenderModel->diffuseTextureId;
 	vr::RenderModel_TextureMap_t * texture = NULL;
-
-	//UTexture2DDynamic * OutTexture = nullptr;
 	UTexture2D* OutTexture = nullptr;
-	vr::EVRRenderModelError TextureErrorCode = VRRenderModels->LoadTexture_Async(texID, &texture);
 
-	if (TextureErrorCode != vr::EVRRenderModelError::VRRenderModelError_None)
+	if (texID != vr::INVALID_TEXTURE_ID)
 	{
-		if (TextureErrorCode != vr::EVRRenderModelError::VRRenderModelError_Loading)
+		//UTexture2DDynamic * OutTexture = nullptr;
+		vr::EVRRenderModelError TextureErrorCode = VRRenderModels->LoadTexture_Async(texID, &texture);
+
+		if (TextureErrorCode != vr::EVRRenderModelError::VRRenderModelError_None)
+		{
+			if (TextureErrorCode != vr::EVRRenderModelError::VRRenderModelError_Loading)
+			{
+				UE_LOG(OpenVRExpansionFunctionLibraryLog, Warning, TEXT("Couldn't Load Texture!!"));
+				Result = EAsyncBlueprintResultSwitch::OnFailure;
+			}
+			else
+				Result = EAsyncBlueprintResultSwitch::AsyncLoading;
+
+			return nullptr;
+		}
+
+		if (!texture)
 		{
 			UE_LOG(OpenVRExpansionFunctionLibraryLog, Warning, TEXT("Couldn't Load Texture!!"));
 			Result = EAsyncBlueprintResultSwitch::OnFailure;
+			return nullptr;
 		}
-		else
-			Result = EAsyncBlueprintResultSwitch::AsyncLoading;
-
-		return nullptr;
-	}
-
-	if (!texture)
-	{
-		UE_LOG(OpenVRExpansionFunctionLibraryLog, Warning, TEXT("Couldn't Load Texture!!"));
-		Result = EAsyncBlueprintResultSwitch::OnFailure;
-		return nullptr;
 	}
 
 	if (ProceduralMeshComponentsToFill.Num() > 0)
@@ -971,39 +977,42 @@ UTexture2D * UOpenVRExpansionFunctionLibrary::GetVRDeviceModelAndTexture(UObject
 		}
 	}
 
-	uint32 Width = texture->unWidth;
-	uint32 Height = texture->unHeight;
-
-
-	//OutTexture = UTexture2DDynamic::Create(Width, Height, PF_R8G8B8A8);
-	OutTexture = UTexture2D::CreateTransient(Width, Height, PF_R8G8B8A8);
-
-
-	//FTexture2DDynamicResource * TexResource = static_cast<FTexture2DDynamicResource*>(OutTexture->Resource);
-	//FTexture2DRHIParamRef TextureRHI = TexResource->GetTexture2DRHI();
-
-	//uint32 DestStride = 0;
-	//uint8* MipData = reinterpret_cast<uint8*>(RHILockTexture2D(TextureRHI, 0, RLM_WriteOnly, DestStride, false, false));
-
-	uint8* MipData = (uint8*)OutTexture->PlatformData->Mips[0].BulkData.Lock(LOCK_READ_WRITE);
-	FMemory::Memcpy(MipData, (void*)texture->rubTextureMapData, Height * Width * 4);
-	OutTexture->PlatformData->Mips[0].BulkData.Unlock();
-	//RHIUnlockTexture2D(TextureRHI, 0, false, false);
-
-
-	//Setting some Parameters for the Texture and finally returning it
-	OutTexture->PlatformData->NumSlices = 1;
-	OutTexture->NeverStream = true;
-	OutTexture->UpdateResource();
-
-	/*if (bReturnRawTexture)
+	if (texture != nullptr)
 	{
-		OutRawTexture.AddUninitialized(Height * Width * 4);
-		FMemory::Memcpy(OutRawTexture.GetData(), (void*)texture->rubTextureMapData, Height * Width * 4);
-	}*/
+		uint32 Width = texture->unWidth;
+		uint32 Height = texture->unHeight;
 
-	Result = EAsyncBlueprintResultSwitch::OnSuccess;
-	VRRenderModels->FreeTexture(texture);
+
+		//OutTexture = UTexture2DDynamic::Create(Width, Height, PF_R8G8B8A8);
+		OutTexture = UTexture2D::CreateTransient(Width, Height, PF_R8G8B8A8);
+
+
+		//FTexture2DDynamicResource * TexResource = static_cast<FTexture2DDynamicResource*>(OutTexture->Resource);
+		//FTexture2DRHIParamRef TextureRHI = TexResource->GetTexture2DRHI();
+
+		//uint32 DestStride = 0;
+		//uint8* MipData = reinterpret_cast<uint8*>(RHILockTexture2D(TextureRHI, 0, RLM_WriteOnly, DestStride, false, false));
+
+		uint8* MipData = (uint8*)OutTexture->PlatformData->Mips[0].BulkData.Lock(LOCK_READ_WRITE);
+		FMemory::Memcpy(MipData, (void*)texture->rubTextureMapData, Height * Width * 4);
+		OutTexture->PlatformData->Mips[0].BulkData.Unlock();
+		//RHIUnlockTexture2D(TextureRHI, 0, false, false);
+
+
+		//Setting some Parameters for the Texture and finally returning it
+		OutTexture->PlatformData->NumSlices = 1;
+		OutTexture->NeverStream = true;
+		OutTexture->UpdateResource();
+
+		/*if (bReturnRawTexture)
+		{
+			OutRawTexture.AddUninitialized(Height * Width * 4);
+			FMemory::Memcpy(OutRawTexture.GetData(), (void*)texture->rubTextureMapData, Height * Width * 4);
+		}*/
+
+		Result = EAsyncBlueprintResultSwitch::OnSuccess;
+		VRRenderModels->FreeTexture(texture);
+	}
 
 	VRRenderModels->FreeRenderModel(RenderModel);
 	return OutTexture;

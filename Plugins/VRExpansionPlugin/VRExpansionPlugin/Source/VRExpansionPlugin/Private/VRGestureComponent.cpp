@@ -95,7 +95,8 @@ void UGesturesDatabase::FillSplineWithGesture(FVRGesture &Gesture, USplineCompon
 				newSplineMesh->SetMobility(EComponentMobility::Movable);
 				CurrentSplineChildren.Add(newSplineMesh);
 				newSplineMesh->SetStaticMesh(Mesh);
-				newSplineMesh->SetMaterial(0, MeshMat);
+				newSplineMesh->SetMaterial(0, (UMaterialInterface*)MeshMat);
+
 				newSplineMesh->AttachToComponent(SplineComponent, FAttachmentTransformRules::SnapToTargetIncludingScale);
 				newSplineMesh->SetVisibility(true);
 			}
@@ -225,7 +226,7 @@ void UVRGestureComponent::CaptureGestureFrame()
 					MeshComp->RegisterComponentWithWorld(GetWorld());
 					MeshComp->SetMobility(EComponentMobility::Movable);
 					MeshComp->SetStaticMesh(SplineMesh);
-					MeshComp->SetMaterial(0, SplineMaterial);
+					MeshComp->SetMaterial(0, (UMaterialInterface*)SplineMaterial);
 					bFoundEmptyMesh = true;
 					break;
 				}
@@ -245,7 +246,7 @@ void UVRGestureComponent::CaptureGestureFrame()
 				RecordingGestureDraw.SplineMeshes.Add(MeshComp);
 				MeshIndex = RecordingGestureDraw.SplineMeshes.Num() - 1;
 				MeshComp->SetStaticMesh(SplineMesh);
-				MeshComp->SetMaterial(0, SplineMaterial);
+				MeshComp->SetMaterial(0, (UMaterialInterface*)SplineMaterial);
 				if (!bGetGestureInWorldSpace && TargetCharacter)
 					MeshComp->AttachToComponent(TargetCharacter->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
 			}
@@ -324,21 +325,24 @@ void UVRGestureComponent::RecognizeGesture(FVRGesture inputGesture)
 	int OutGestureIndex = -1;
 	bool bMirrorGesture = false;
 
+	FVector Size = inputGesture.GestureSize.GetSize();
+	float Scaler = GesturesDB->TargetGestureScale / Size.GetMax();
+	float FinalScaler = Scaler;
+
 	for (int i = 0; i < GesturesDB->Gestures.Num(); i++)
 	{
-		FVRGesture exampleGesture = GesturesDB->Gestures[i];
+		FVRGesture &exampleGesture = GesturesDB->Gestures[i];
 
 		if (!exampleGesture.GestureSettings.bEnabled || exampleGesture.Samples.Num() < 1 || inputGesture.Samples.Num() < exampleGesture.GestureSettings.Minimum_Gesture_Length)
 			continue;
 
+		FinalScaler = exampleGesture.GestureSettings.bEnableScaling ? Scaler : 1.f;
+
 		bMirrorGesture = (MirroringHand != EVRGestureMirrorMode::GES_NoMirror && MirroringHand != EVRGestureMirrorMode::GES_MirrorBoth && MirroringHand == exampleGesture.GestureSettings.MirrorMode);
 
-		FVector Size = inputGesture.GestureSize.GetSize();
-		float Scaler = GesturesDB->TargetGestureScale / Size.GetMax();
-
-		if (GetGestureDistance(inputGesture.Samples[0] * Scaler, exampleGesture.Samples[0], bMirrorGesture) < FMath::Square(exampleGesture.GestureSettings.firstThreshold))
+		if (GetGestureDistance(inputGesture.Samples[0] * FinalScaler, exampleGesture.Samples[0], bMirrorGesture) < FMath::Square(exampleGesture.GestureSettings.firstThreshold))
 		{
-			float d = dtw(inputGesture, exampleGesture, bMirrorGesture, Scaler) / (exampleGesture.Samples.Num());
+			float d = dtw(inputGesture, exampleGesture, bMirrorGesture, FinalScaler) / (exampleGesture.Samples.Num());
 			if (d < minDist && d < FMath::Square(exampleGesture.GestureSettings.FullThreshold))
 			{
 				minDist = d;
@@ -348,9 +352,9 @@ void UVRGestureComponent::RecognizeGesture(FVRGesture inputGesture)
 		else if (exampleGesture.GestureSettings.MirrorMode == EVRGestureMirrorMode::GES_MirrorBoth)
 		{
 			bMirrorGesture = true;
-			if (GetGestureDistance(inputGesture.Samples[0] * Scaler, exampleGesture.Samples[0], bMirrorGesture) < FMath::Square(exampleGesture.GestureSettings.firstThreshold))
+			if (GetGestureDistance(inputGesture.Samples[0] * FinalScaler, exampleGesture.Samples[0], bMirrorGesture) < FMath::Square(exampleGesture.GestureSettings.firstThreshold))
 			{
-				float d = dtw(inputGesture, exampleGesture, bMirrorGesture, Scaler) / (exampleGesture.Samples.Num());
+				float d = dtw(inputGesture, exampleGesture, bMirrorGesture, FinalScaler) / (exampleGesture.Samples.Num());
 				if (d < minDist && d < FMath::Square(exampleGesture.GestureSettings.FullThreshold))
 				{
 					minDist = d;

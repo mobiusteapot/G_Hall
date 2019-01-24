@@ -3,7 +3,17 @@
 #pragma once
 #include "CoreMinimal.h"
 #include "VRBPDatatypes.h"
+#include "AITypes.h"
+#include "AI/Navigation/NavigationTypes.h"
+#include "Navigation/PathFollowingComponent.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "VRBaseCharacterMovementComponent.generated.h"
+
+
+/** Delegate for notification when to handle a climbing step up, will override default step up logic if is bound to. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVROnPerformClimbingStepUp, FVector, FinalStepUpLocation);
 
 /** Shared pointer for easy memory management of FSavedMove_Character, for accumulating and replaying network moves. */
 //typedef TSharedPtr<class FSavedMove_Character> FSavedMovePtr;
@@ -276,10 +286,10 @@ public:
 			//Ar.SerializeBits(&bHasMoveAction, 1);
 
 			if (bHasVRinput)
-				bOutSuccess &= SerializePackedVector<100, 30>(CustomVRInputVector, Ar);
+				bOutSuccess &= SerializePackedVector<100, 22/*30*/>(CustomVRInputVector, Ar);
 
 			if (bHasRequestedVelocity)
-				bOutSuccess &= SerializePackedVector<100, 30>(RequestedVelocity, Ar);
+				bOutSuccess &= SerializePackedVector<100, 22/*30*/>(RequestedVelocity, Ar);
 
 			//if (bHasMoveAction)
 			MoveActionArray.NetSerialize(Ar, Map, bOutSuccess);
@@ -566,6 +576,15 @@ public:
 	// Overriding this to run the seated logic
 	virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction *ThisTickFunction) override;
 
+	// Called when a valid climbing step up movement is found, if bound to the default auto step up is not performed to let custom step up logic happen instead.
+	UPROPERTY(BlueprintAssignable, Category = "VRMovement")
+		FVROnPerformClimbingStepUp OnPerformClimbingStepUp;
+
+	virtual void OnMoveCompleted(FAIRequestID RequestID, const FPathFollowingResult& Result);
+
+	// Can't be inline anymore
+	FVector GetActorFeetLocationVR() const;
+
 	FORCEINLINE bool HasRequestedVelocity()
 	{
 		return bHasRequestedVelocity;
@@ -644,8 +663,11 @@ public:
 	// Rewind the relative movement that we had with the HMD
 	inline void RewindVRRelativeMovement()
 	{
-		//FHitResult AHit;
-		MoveUpdatedComponent(-AdditionalVRInputVector, UpdatedComponent->GetComponentQuat(), false);
+		if (bApplyAdditionalVRInputVectorAsNegative)
+		{
+			//FHitResult AHit;
+			MoveUpdatedComponent(-AdditionalVRInputVector, UpdatedComponent->GetComponentQuat(), false);
+		}
 		//SafeMoveUpdatedComponent(-AdditionalVRInputVector, UpdatedComponent->GetComponentQuat(), false, AHit);
 	}
 
@@ -756,6 +778,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRMovement|Climbing")
 		float VRClimbingStepUpMultiplier;
 
+	// If true will clamp the maximum movement on climbing step up to: VRClimbingStepUpMaxSize
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRMovement|Climbing")
+		bool bClampClimbingStepUp;
+
+	// Maximum X/Y vector size to use when climbing stepping up (prevents very deep step ups from large movements).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRMovement|Climbing")
+		float VRClimbingStepUpMaxSize;
+
 	// If true will automatically set falling when a stepup occurs during climbing
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRMovement|Climbing")
 		bool SetDefaultPostClimbMovementOnStepUp;
@@ -779,6 +809,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRMovement|Climbing")
 		EVRConjoinedMovementModes DefaultPostClimbMovement;
 
+	// Overloading this to handle an edge case
+	virtual void ApplyNetworkMovementMode(const uint8 ReceivedMode) override;
+
 	/*
 	* This is called client side to make a replicated movement mode change that hits the server in the saved move.
 	*
@@ -788,6 +821,16 @@ public:
 	*/
 	UFUNCTION(BlueprintCallable, Category = "VRMovement")
 		void SetReplicatedMovementMode(EVRConjoinedMovementModes NewMovementMode);
+
+	/*
+	* Call this to convert the current movement mode to a Conjoined one for reference
+	*
+	* Custom Movement Mode is currently limited to 0 - 8, the index's 0 and 1 are currently used up for the plugin movement modes.
+	* So setting it to 0 or 1 would be Climbing, and LowGrav respectivly, this leaves 2-8 as open index's for use.
+	* For a total of 6 Custom movement modes past the currently implemented plugin ones.
+	*/
+	UFUNCTION(BlueprintPure, Category = "VRMovement")
+		EVRConjoinedMovementModes GetReplicatedMovementMode();
 
 	// We use 4 bits for this so a maximum of 16 elements
 	EVRConjoinedMovementModes VRReplicatedMovementMode;

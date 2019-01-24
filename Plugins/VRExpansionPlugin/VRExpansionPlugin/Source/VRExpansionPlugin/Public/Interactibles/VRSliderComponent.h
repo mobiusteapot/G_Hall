@@ -10,6 +10,7 @@
 #include "GameplayTagAssetInterface.h"
 #include "Components/SplineComponent.h"
 #include "VRInteractibleFunctionLibrary.h"
+#include "Components/StaticMeshComponent.h"
 
 #include "VRSliderComponent.generated.h"
 
@@ -33,6 +34,7 @@ enum class EVRInteractibleSliderDropBehavior : uint8
 
 /** Delegate for notification when the slider state changes. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVRSliderHitPointSignature, float, SliderProgressPoint);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVRSliderFinishedLerpingSignature, float, FinalProgress);
 
 /**
 * A slider component, can act like a scroll bar, or gun bolt, or spline following component
@@ -49,11 +51,19 @@ public:
 	~UVRSliderComponent();
 
 	// Call to use an object
-	UPROPERTY(BlueprintAssignable, Category = "VRLeverComponent")
+	UPROPERTY(BlueprintAssignable, Category = "VRSliderComponent")
 		FVRSliderHitPointSignature OnSliderHitPoint;
 
-	UFUNCTION(BlueprintImplementableEvent, meta = (DisplayName = "Lever State Changed"))
+	UFUNCTION(BlueprintImplementableEvent, meta = (DisplayName = "Slider State Changed"))
 		void ReceiveSliderHitPoint(float SliderProgressPoint);
+
+	UPROPERTY(BlueprintAssignable, Category = "VRSliderComponent")
+		FVRSliderFinishedLerpingSignature OnSliderFinishedLerping;
+
+	UFUNCTION(BlueprintImplementableEvent, meta = (DisplayName = "Slider Finished Lerping"))
+		void ReceiveSliderFinishedLerping(float FinalProgress);
+
+	
 
 	float LastSliderProgressState;
 
@@ -155,6 +165,9 @@ public:
 	FVector InitialInteractorLocation;
 	FVector InitialGripLoc;
 	FVector InitialDropLocation;
+
+	// Checks if we should throw some events
+	void CheckSliderProgress();
 
 	// Calculates the current slider progress
 	UFUNCTION(BlueprintCallable, Category = "VRSliderComponent")
@@ -359,10 +372,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
 		EGripMovementReplicationSettings MovementReplicationSetting;
 
+	// Distance before the object will break out of the hand, 0.0f == never will
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
 		float BreakDistance;
 
-	UPROPERTY(BlueprintReadWrite, Category = "VRGripInterface")
+	// Should we deny gripping on this object
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRGripInterface")
 		bool bDenyGripping;
 
 	UPROPERTY(BlueprintReadOnly, Category = "VRGripInterface")
@@ -463,6 +478,10 @@ public:
 	// Get interactable settings
 	//UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
 		//FBPInteractionSettings GetInteractionSettings();
+
+	// Get grip scripts
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
+		bool GetGripScripts(TArray<UVRGripScriptBase*> & ArrayReference);
 
 
 	// Events //

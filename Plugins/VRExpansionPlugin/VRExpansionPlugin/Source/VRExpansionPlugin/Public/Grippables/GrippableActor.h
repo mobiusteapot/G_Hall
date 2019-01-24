@@ -8,8 +8,10 @@
 #include "VRExpansionFunctionLibrary.h"
 #include "GameplayTagContainer.h"
 #include "GameplayTagAssetInterface.h"
+#include "GripScripts/VRGripScriptBase.h"
+#include "Engine/ActorChannel.h"
+#include "DrawDebugHelpers.h"
 #include "GrippableActor.generated.h"
-
 
 /**
 *
@@ -24,6 +26,16 @@ public:
 
 
 	~AGrippableActor();
+	virtual void BeginPlay() override;
+
+	UPROPERTY(EditAnywhere, Replicated, BlueprintReadOnly, Instanced, Category = "VRGripInterface")
+		TArray<class UVRGripScriptBase *> GripLogicScripts;
+
+	bool ReplicateSubobjects(UActorChannel* Channel, class FOutBunch *Bunch, FReplicationFlags *RepFlags) override;
+
+	// Sets the Deny Gripping variable on the FBPInterfaceSettings struct
+	UFUNCTION(BlueprintCallable, Category = "VRGripInterface")
+	void SetDenyGripping(bool bDenyGripping);
 
 	// ------------------------------------------------
 	// Gameplay tag interface
@@ -94,6 +106,32 @@ public:
 			return;
 		}
 
+		Super::OnRep_ReplicateMovement();
+
+		// 4.21 "fixed" the bReplicateMovement issue, had to comment out my old fix to play nice
+		// Leaving the original code here commented out for now as a reference in case I need it.
+		/*
+		// Since ReplicatedMovement and AttachmentReplication are REPNOTIFY_Always (and OnRep_AttachmentReplication may call OnRep_ReplicatedMovement directly),
+		// this check is needed since this can still be called on actors for which bReplicateMovement is false - for example, during fast-forward in replay playback.
+		// When this happens, the values in ReplicatedMovement aren't valid, and must be ignored.
+		if (!bReplicateMovement)
+		{
+			return;
+		}
+
+#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+		static const auto CVarDrawDebugRepMovement = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("Net.RepMovement.DrawDebug"));
+		if (CVarDrawDebugRepMovement->GetValueOnGameThread() > 0)
+		{
+			DrawDebugCapsule(GetWorld(), ReplicatedMovement.Location, GetSimpleCollisionHalfHeight(), GetSimpleCollisionRadius(), ReplicatedMovement.Rotation.Quaternion(), FColor(100, 255, 100), true, 1.f);
+		}
+#endif
+
+		if (bAllowIgnoringAttachOnOwner && ShouldWeSkipAttachmentReplication())
+		{
+			return;
+		}
+
 		if (RootComponent)
 		{
 			// This "fix" corrects the simulation state not replicating over correctly
@@ -109,7 +147,84 @@ public:
 
 		}
 
-		Super::OnRep_ReplicateMovement();
+		Super::OnRep_ReplicateMovement();*/
+	}
+
+	void PostNetReceivePhysicState() override
+	{
+		if (VRGripInterfaceSettings.bIsHeld && bAllowIgnoringAttachOnOwner && ShouldWeSkipAttachmentReplication())
+		{
+			return;
+		}
+
+		Super::PostNetReceivePhysicState();
+	}
+
+	// Debug printing of when the object is replication destroyed
+	/*virtual void OnSubobjectDestroyFromReplication(UObject *Subobject) override
+	{
+	Super::OnSubobjectDestroyFromReplication(Subobject);
+
+	GEngine->AddOnScreenDebugMessage(-1, 15.f, FColor::Red, FString::Printf(TEXT("Killed Object On Actor: x: %s"), *Subobject->GetName()));
+	}*/
+
+	// This isn't called very many places but it does come up
+	virtual void MarkComponentsAsPendingKill() override
+	{
+		Super::MarkComponentsAsPendingKill();
+
+		for (int32 i = 0; i < GripLogicScripts.Num(); ++i)
+		{
+			if (UObject *SubObject = GripLogicScripts[i])
+			{
+				SubObject->MarkPendingKill();
+			}
+		}
+
+		GripLogicScripts.Empty();
+	}
+
+	/** Called right before being marked for destruction due to network replication */
+	// Clean up our objects so that they aren't sitting around for GC
+	virtual void PreDestroyFromReplication() override
+	{
+		Super::PreDestroyFromReplication();
+
+		// Destroy any sub-objects we created
+		for (int32 i = 0; i < GripLogicScripts.Num(); ++i)
+		{
+			if (UObject *SubObject = GripLogicScripts[i])
+			{
+				OnSubobjectDestroyFromReplication(SubObject); //-V595
+				SubObject->PreDestroyFromReplication();
+				SubObject->MarkPendingKill();
+			}
+		}
+
+		for (UActorComponent * ActorComp : GetComponents())
+		{
+			// Pending kill components should have already had this called as they were network spawned and are being killed
+			if (ActorComp && !ActorComp->IsPendingKill() && ActorComp->GetClass()->ImplementsInterface(UVRGripInterface::StaticClass()))
+				ActorComp->PreDestroyFromReplication();
+		}
+
+		GripLogicScripts.Empty();
+	}
+
+	// On Destroy clean up our objects
+	virtual void BeginDestroy() override
+	{
+		Super::BeginDestroy();
+
+		for (int32 i = 0; i < GripLogicScripts.Num(); i++)
+		{
+			if (UObject *SubObject = GripLogicScripts[i])
+			{
+				SubObject->MarkPendingKill();
+			}
+		}
+
+		GripLogicScripts.Empty();
 	}
 
 	UPROPERTY(EditAnywhere, Replicated, BlueprintReadWrite, Category = "VRGripInterface")
@@ -183,6 +298,10 @@ public:
 	// Get interactable settings
 	//UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
 		//FBPInteractionSettings GetInteractionSettings();
+
+	// Get grip scripts
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
+		bool GetGripScripts(TArray<UVRGripScriptBase*> & ArrayReference);
 
 	// Events //
 
